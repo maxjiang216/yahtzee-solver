@@ -14,9 +14,9 @@ CXXFLAGS = -O3 -std=c++17 -Wall -Wextra
 LDFLAGS = -fopenmp
 
 # Source files
-SOLVER_SRC = yahtzee_optimized_solver.cpp
-STRATEGY_SRC = yahtzee_strategy.cpp
-GUIDE_SRC = yahtzee_guide_v3.cpp
+SOLVER_SRC = cpp/yahtzee_optimized_solver.cpp
+STRATEGY_SRC = cpp/yahtzee_strategy.cpp
+GUIDE_SRC = cpp/yahtzee_guide_v3.cpp
 
 # Object files
 SOLVER_OBJ = yahtzee_optimized_solver.o
@@ -41,7 +41,7 @@ all: solver demo pmf
 .PHONY: pmf
 pmf: $(PMF_BIN)
 
-$(PMF_BIN): yahtzee_pmf_solver.cpp
+$(PMF_BIN): cpp/yahtzee_pmf_solver.cpp
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $<
 	@echo "PMF solver built. Run 'make pmf-solve' to generate $(PMF_FILE)"
 
@@ -105,7 +105,7 @@ solve: $(SOLVER_BIN)
 .PHONY: test-build
 test-build: $(TEST_BIN)
 
-$(TEST_BIN): test_strategy.cpp $(STRATEGY_SRC)
+$(TEST_BIN): cpp/test_strategy.cpp $(STRATEGY_SRC)
 	$(CXX) $(CXXFLAGS) -o $@ $^
 	@echo ""
 	@echo "Test built successfully!"
