@@ -1,0 +1,15 @@
+# Large binary data files (regenerable, too large for GitHub)
+*.bin
+
+# Compiled executables
+yahtzee_solver
+yahtzee_guide
+yahtzee_guide_test
+yahtzee_pmf_solver
+strategy_demo
+test_probabilities
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
