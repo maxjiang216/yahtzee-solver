@@ -17,11 +17,16 @@
  *   in double) instead of a 462x252 transition matrix
  * - Scores are looked up from a precomputed 252x13 table
  * - Only reachable upper totals are solved; unreachable entries stay 0
- * 
- * Total storage: ~1.59 GB
+ *
+ * Output file: ~1.59 GB
  *   - Board EVs (start of turn): 3.1 MB
  *   - Roll1 EVs (2 rolls left): 793 MB
  *   - Roll2 EVs (1 roll left): 793 MB
+ *
+ * Only the board EVs are kept in memory. The DP never reads roll EVs back,
+ * so each state's 252-entry roll rows are streamed straight into the output
+ * file with pwrite(). The file is pre-sized with ftruncate(), so unreachable
+ * rows are never written: they are holes that read back as zeros.
  * 
  * STATE REPRESENTATION:
  * ====================
@@ -55,6 +60,11 @@
  #include <cstring>
  #include <array>
  #include <cstdint>
+ #include <cerrno>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <fcntl.h>
+ #include <unistd.h>
  
  // -------------------------------------------------------------------------
  // CONSTANTS
@@ -202,10 +212,10 @@
  /**
   * YahtzeeSolver: Computes optimal strategy using dynamic programming
   * 
-  * Stores three tables:
-  * 1. board_ev: Expected value at start of turn (786K states)
-  * 2. roll1_ev: Expected value with 2 rolls left (198M states)
-  * 3. roll2_ev: Expected value with 1 roll left (198M states)
+  * Produces three tables:
+  * 1. board_ev: Expected value at start of turn (786K states, in memory)
+  * 2. roll1_ev: Expected value with 2 rolls left (198M states, streamed to file)
+  * 3. roll2_ev: Expected value with 1 roll left (198M states, streamed to file)
   * 
   * All tables use float (4 bytes) for 50% memory savings vs double.
   */
@@ -218,11 +228,8 @@
      AllocateTables();
    }
  
-   // Main solver - compute all EVs
-   void Solve();
-   
-   // Save to binary file
-   void SaveToFile(const std::string& filename);
+   // Main solver - compute all EVs and write them to filename
+   void Solve(const std::string& filename);
  
   private:
    // Dice indexing
@@ -246,10 +253,15 @@
    // Optimization: valid_subsets_for_outcome[outcome_id] = list of subset_ids
    std::vector<std::vector<int>> valid_subsets_for_outcome_;
  
-   // EV tables (using float for memory efficiency)
+   // Board EV table (roll tables go straight to the output file)
    std::vector<float> board_ev_;   // 786K entries × 4 bytes = 3.1 MB
-   std::vector<float> roll1_ev_;   // 198M entries × 4 bytes = 793 MB
-   std::vector<float> roll2_ev_;   // 198M entries × 4 bytes = 793 MB
+
+   // Output file layout: 16-byte header, board, roll1, roll2
+   static const size_t kHeaderBytes = 16;
+   static const size_t kRoll1Offset = kHeaderBytes + sizeof(float) * BOARD_STATE_SIZE;
+   static const size_t kRoll2Offset = kRoll1Offset + sizeof(float) * ROLL_STATE_SIZE;
+   static const size_t kFileBytes = kRoll2Offset + sizeof(float) * ROLL_STATE_SIZE;
+   int out_fd_ = -1;
  
    // Indexing functions
    inline size_t BoardIndex(int mask, int upper, int y_state) const {
@@ -279,20 +291,14 @@
      board_ev_[BoardIndex(mask, upper, y_state)] = val;
    }
  
-   inline float GetRoll1EV(int mask, int upper, int y_state, int dice_id) const {
-     return roll1_ev_[RollIndex(mask, upper, y_state, dice_id)];
-   }
- 
-   inline void SetRoll1EV(int mask, int upper, int y_state, int dice_id, float val) {
-     roll1_ev_[RollIndex(mask, upper, y_state, dice_id)] = val;
-   }
- 
-   inline float GetRoll2EV(int mask, int upper, int y_state, int dice_id) const {
-     return roll2_ev_[RollIndex(mask, upper, y_state, dice_id)];
-   }
- 
-   inline void SetRoll2EV(int mask, int upper, int y_state, int dice_id, float val) {
-     roll2_ev_[RollIndex(mask, upper, y_state, dice_id)] = val;
+   // Write bytes at an absolute file offset (thread-safe; exits on error)
+   void WriteAt(size_t offset, const void* data, size_t bytes) const;
+
+   // Write one state's 252 roll EVs to the table starting at table_offset
+   inline void WriteRollRow(size_t table_offset, int mask, int upper, int y_state,
+                            const float* values) const {
+     WriteAt(table_offset + sizeof(float) * RollIndex(mask, upper, y_state, 0),
+             values, sizeof(float) * NUM_DICE_COMBOS);
    }
  
    // Helper functions
@@ -403,33 +409,24 @@
  
  void YahtzeeSolver::AllocateTables() {
    std::cout << "\nAllocating memory..." << std::endl;
-   std::cout << "  Board states: " << BOARD_STATE_SIZE << std::endl;
-   std::cout << "  Roll states: " << ROLL_STATE_SIZE << std::endl;
-   
-   try {
-     board_ev_.resize(BOARD_STATE_SIZE, 0.0f);
-     std::cout << "  board_ev: " 
-               << BOARD_STATE_SIZE * sizeof(float) / (1024 * 1024) 
-               << " MB" << std::endl;
-     
-     roll1_ev_.resize(ROLL_STATE_SIZE, 0.0f);
-     std::cout << "  roll1_ev: " 
-               << ROLL_STATE_SIZE * sizeof(float) / (1024 * 1024) 
-               << " MB" << std::endl;
-     
-     roll2_ev_.resize(ROLL_STATE_SIZE, 0.0f);
-     std::cout << "  roll2_ev: " 
-               << ROLL_STATE_SIZE * sizeof(float) / (1024 * 1024) 
-               << " MB" << std::endl;
-     
-     size_t total_mb = (BOARD_STATE_SIZE + 2 * ROLL_STATE_SIZE) * 
-                       sizeof(float) / (1024 * 1024);
-     std::cout << "  Total memory: " << total_mb << " MB" << std::endl;
-     std::cout << "Memory allocated successfully\n" << std::endl;
-     
-   } catch (const std::bad_alloc& e) {
-     std::cerr << "FATAL: Memory allocation failed: " << e.what() << std::endl;
-     throw;
+   board_ev_.assign(BOARD_STATE_SIZE, 0.0f);
+   std::cout << "  board_ev: " 
+             << BOARD_STATE_SIZE * sizeof(float) / (1024 * 1024) 
+             << " MB (roll tables are streamed to disk)\n" << std::endl;
+ }
+
+ void YahtzeeSolver::WriteAt(size_t offset, const void* data, size_t bytes) const {
+   const char* p = static_cast<const char*>(data);
+   while (bytes > 0) {
+     ssize_t n = pwrite(out_fd_, p, bytes, static_cast<off_t>(offset));
+     if (n < 0) {
+       if (errno == EINTR) continue;
+       std::perror("FATAL: pwrite failed");
+       std::exit(1);
+     }
+     p += n;
+     offset += n;
+     bytes -= n;
    }
  }
  
@@ -582,7 +579,14 @@
    return {max_val, best_cat};
  }
  
- void YahtzeeSolver::Solve() {
+ void YahtzeeSolver::Solve(const std::string& filename) {
+  std::cout << "Writing strategy to " << filename << std::endl;
+  out_fd_ = open(filename.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+  if (out_fd_ < 0 || ftruncate(out_fd_, static_cast<off_t>(kFileBytes)) != 0) {
+    std::perror("FATAL: could not create output file");
+    std::exit(1);
+  }
+
   std::cout << "Starting optimization (reverse induction)...\n" << std::endl;
   
   // Temporary arrays for computation
@@ -637,15 +641,11 @@
 
         // Stage 2: Roll2 optimization (1 roll left)
         RerollStage(term_values.data(), roll2_values.data(), subset_exp.data());
-        for (int d = 0; d < NUM_DICE_COMBOS; d++) {
-          SetRoll2EV(mask, upper, y_state, d, roll2_values[d]);
-        }
+        WriteRollRow(kRoll2Offset, mask, upper, y_state, roll2_values.data());
 
         // Stage 3: Roll1 optimization (2 rolls left)
         RerollStage(roll2_values.data(), roll1_values.data(), subset_exp.data());
-        for (int d = 0; d < NUM_DICE_COMBOS; d++) {
-          SetRoll1EV(mask, upper, y_state, d, roll1_values[d]);
-        }
+        WriteRollRow(kRoll1Offset, mask, upper, y_state, roll1_values.data());
 
         // Stage 4: Start of turn = expectation over the initial roll (keep nothing)
         for (int d = 0; d < NUM_DICE_COMBOS; d++) {
@@ -670,49 +670,24 @@
   }
   
   std::cout << "\nOptimization complete!" << std::endl;
-}
 
- void YahtzeeSolver::SaveToFile(const std::string& filename) {
-   std::cout << "\nSaving strategy to " << filename << "..." << std::endl;
-   
-   std::ofstream out(filename, std::ios::binary);
-   if (!out) {
-     std::cerr << "Error: Could not open file for writing" << std::endl;
-     return;
-   }
-   
-   // Header
-   uint32_t magic = 0x59414854;  // "YAHT"
-   uint32_t version = 3;
-   uint32_t board_size = BOARD_STATE_SIZE;
-   uint32_t roll_size = ROLL_STATE_SIZE;
-   
-   out.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
-   out.write(reinterpret_cast<const char*>(&version), sizeof(version));
-   out.write(reinterpret_cast<const char*>(&board_size), sizeof(board_size));
-   out.write(reinterpret_cast<const char*>(&roll_size), sizeof(roll_size));
-   
-   // Write tables
-   out.write(reinterpret_cast<const char*>(board_ev_.data()), 
-             board_ev_.size() * sizeof(float));
-   out.write(reinterpret_cast<const char*>(roll1_ev_.data()), 
-             roll1_ev_.size() * sizeof(float));
-   out.write(reinterpret_cast<const char*>(roll2_ev_.data()), 
-             roll2_ev_.size() * sizeof(float));
-   
-   out.close();
-   
-   size_t total_bytes = sizeof(magic) + sizeof(version) + 
-                        sizeof(board_size) + sizeof(roll_size) +
-                        (board_ev_.size() + roll1_ev_.size() + roll2_ev_.size()) * 
-                        sizeof(float);
-   
-   std::cout << "Strategy saved successfully" << std::endl;
-   std::cout << "  File size: " << total_bytes / (1024 * 1024) << " MB" << std::endl;
-   std::cout << "  Board EVs: " << board_ev_.size() << " entries" << std::endl;
-   std::cout << "  Roll1 EVs: " << roll1_ev_.size() << " entries" << std::endl;
-   std::cout << "  Roll2 EVs: " << roll2_ev_.size() << " entries" << std::endl;
- }
+  // Header and board table go at the front; roll rows are already written
+  uint32_t header[4] = {
+      0x59414854,  // "YAHT"
+      3,           // version
+      static_cast<uint32_t>(BOARD_STATE_SIZE),
+      static_cast<uint32_t>(ROLL_STATE_SIZE)};
+  WriteAt(0, header, sizeof(header));
+  WriteAt(kHeaderBytes, board_ev_.data(), board_ev_.size() * sizeof(float));
+  if (close(out_fd_) != 0) {
+    std::perror("FATAL: close failed");
+    std::exit(1);
+  }
+  out_fd_ = -1;
+
+  std::cout << "Strategy saved successfully" << std::endl;
+  std::cout << "  File size: " << kFileBytes / (1024 * 1024) << " MB" << std::endl;
+}
  
  // -------------------------------------------------------------------------
  // MAIN
@@ -726,8 +701,7 @@
    auto start_time = std::chrono::high_resolution_clock::now();
    
    YahtzeeSolver solver;
-   solver.Solve();
-   solver.SaveToFile("yahtzee_optimal_v3.bin");
+   solver.Solve("yahtzee_optimal_v3.bin");
    
    auto end_time = std::chrono::high_resolution_clock::now();
    auto duration = std::chrono::duration_cast<std::chrono::seconds>(

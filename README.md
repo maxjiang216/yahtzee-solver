@@ -52,7 +52,7 @@ pip install -r requirements.txt
 
 ```bash
 make solver && make solve
-# Produces yahtzee_optimal_v3.bin (~1.5 GB, ~20 s, mostly writing the file)
+# Produces yahtzee_optimal_v3.bin (~1.5 GB file, ~9 s, ~11 MB of RAM)
 ```
 
 ### 2. Generate the PMF table

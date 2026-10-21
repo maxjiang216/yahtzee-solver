@@ -108,7 +108,7 @@ $(GUIDE_BIN): $(GUIDE_SRC) $(STRATEGY_SRC)
 # Run solver to generate strategy file
 .PHONY: solve
 solve: $(SOLVER_BIN)
-	@echo "Running solver (takes ~20 s, mostly writing the 1.5 GB file)..."
+	@echo "Running solver (~9 s; streams the 1.5 GB table to disk)..."
 	@echo ""
 	./$(SOLVER_BIN)
 	@echo ""
@@ -172,7 +172,7 @@ help:
 	@echo "  make rational  - Build the exact rational EV solver"
 	@echo "  make rational-solve - Compute the exact EV table (~5 s)"
 	@echo "  make all       - Build solver and demo"
-	@echo "  make solve     - Run solver to generate strategy file (~20 s)"
+	@echo "  make solve     - Run solver to generate strategy file (~9 s)"
 	@echo "  make test      - Run demo to test the strategy"
 	@echo "  make clean     - Remove executables and object files"
 	@echo "  make distclean - Remove everything including strategy file"
