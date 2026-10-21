@@ -1,835 +1,585 @@
 /**
- * Yahtzee PMF Solver
- * 
- * Computes the probability mass function (PMF) of future scores for each
- * board state, assuming optimal play. This allows computing win probabilities
- * against an opponent.
- * 
- * For each state (mask, upper, y_state), we compute:
- *   P(future_score = s) for all possible s
- * 
- * This matches the EV solver's board_ev semantics - it's the distribution
- * of points scored FROM THIS POINT FORWARD, not cumulative.
- * 
- * DATA STRUCTURE:
- * ==============
- * To handle the long tail from Yahtzee bonuses efficiently:
- * - Dense array for scores 0-400 (covers 99.9%+ of probability mass)
- * - Sparse map for scores 401+ (rare multi-Yahtzee scenarios)
- * 
- * MEMORY:
+ * Yahtzee Exact PMF Solver
+ *
+ * Computes, for every reachable board state, the exact probability
+ * distribution of the score still to come under the EV-optimal policy,
+ * using rational arithmetic throughout (no floating point in the DP).
+ *
+ * POLICY: decided by exact EVs (yahtzee_exact_turn.h), so near-ties are never
+ * misjudged by rounding. Exact ties, which leave the EV unchanged but can
+ * change the distribution, are broken by fixed rules: scoring takes the first
+ * best option in rule order; keeps prefer more dice kept, then lowest id.
+ *
+ * WHY IT IS EXACT AND CHEAP:
+ * ==========================
+ * With k turns left, every probability is an integer over D_k = 6^(15k).
+ * Once the turn's policy is fixed, the probability of each final roll is an
+ * integer over 6^15 (< 2^39), found by pushing integer weights through the
+ * keep lattice (1,260 additions per reroll). Final rolls that lead to the same
+ * (points, next board) are merged, and then
+ *
+ *   PMF_k[s] = sum over (points r, next n, weight w) of w * PMF_{k-1}[n][s - r]
+ *
+ * which is one big-integer multiply-add by a 64-bit weight per (pair, score).
+ *
+ * MEMORY: successors are always in the previous layer, so only that layer's
+ * exact distributions are needed. Each is stored over its score range only,
+ * and each probability with only the limbs it needs. By default the two live
+ * layers stay in RAM (peak ~4 GB). With --low-memory, each finished layer is
+ * written to a temporary file (<output>.layer0/1) and read back through a
+ * read-only memory map, so resident memory stays around one layer (~2 GB)
+ * and the OS can drop those clean pages under pressure. Float rows go to a
+ * temporary file (<output>.rows) and are copied into the output in board
+ * order at the end, so the output is byte-for-byte reproducible.
+ *
+ * CHECKS: for every state, the probabilities must sum to exactly 1 and the
+ * distribution's mean must equal the exact EV. Any mismatch aborts.
+ *
+ * OUTPUT:
  * =======
- * - Dense: 786,432 states × 401 scores × 4 bytes = 1.23 GB
- * - Sparse: negligible (few states have significant mass above 400)
+ * yahtzee_pmf_v2.bin (read by python/yahtzee_2player_env.py):
+ *   16-byte header {magic "PMFY", version 2, num_states, dense_size = 1576}
+ *   num_states index entries {uint32 offset, int16 lo, int16 width}: the
+ *     state's probabilities for scores lo .. lo+width-1 are floats
+ *     offset .. offset+width-1 of the data section (width 0: not reachable)
+ *   data section: floats, each the exact probability rounded to float
+ * yahtzee_pmf_exact_start.txt: the exact distribution at the start of the
+ *   game, as numerators over 6^195.
  */
 
- #include <iostream>
- #include <vector>
- #include <map>
- #include <algorithm>
- #include <numeric>
- #include <fstream>
- #include <cmath>
- #include <chrono>
- #include <cassert>
- #include <iomanip>
- #include <omp.h>
- 
- // -------------------------------------------------------------------------
- // CONSTANTS
- // -------------------------------------------------------------------------
- 
- const int NUM_CATS = 13;
- const int CAT_YAHTZEE = 12;
- const int NUM_BOARD_MASKS = (1 << 12);  // 4096
- const int MAX_UPPER_SCORE = 64;
- const int NUM_Y_STATES = 3;
- const int NUM_DICE_COMBOS = 252;
- const int BOARD_STATE_SIZE = NUM_BOARD_MASKS * MAX_UPPER_SCORE * NUM_Y_STATES;
- 
- // PMF constants
- const int DENSE_MAX = 1575; // Dense storage for scores 0-1575 (exact Yahtzee max)
- const int DENSE_SIZE = DENSE_MAX + 1;  // 1576 entries
- const float PROB_THRESHOLD = 1e-10f;  // Ignore probabilities below this
- 
- // -------------------------------------------------------------------------
- // PMF DATA STRUCTURE
- // -------------------------------------------------------------------------
- 
- /**
-  * Probability Mass Function with dense + sparse storage
-  */
- struct PMF {
-     std::vector<float> dense;  // P(score = 0..DENSE_MAX)
-     std::map<int, float> sparse;  // P(score > DENSE_MAX)
-     
-     PMF() : dense(DENSE_SIZE, 0.0f) {}
-     
-     void Clear() {
-         std::fill(dense.begin(), dense.end(), 0.0f);
-         sparse.clear();
-     }
-     
-     void SetProb(int score, float prob) {
-         if (prob < PROB_THRESHOLD) return;
-         if (score <= DENSE_MAX) {
-             dense[score] = prob;
-         } else {
-             sparse[score] = prob;
-         }
-     }
-     
-     void AddProb(int score, float prob) {
-         if (prob < PROB_THRESHOLD) return;
-         if (score <= DENSE_MAX) {
-             dense[score] += prob;
-         } else {
-             sparse[score] += prob;
-         }
-     }
-     
-     float GetProb(int score) const {
-         if (score <= DENSE_MAX) {
-             return dense[score];
-         }
-         auto it = sparse.find(score);
-         return (it != sparse.end()) ? it->second : 0.0f;
-     }
-     
-     // Compute expected value
-     float ExpectedValue() const {
-         float ev = 0.0f;
-         for (int s = 0; s <= DENSE_MAX; s++) {
-             ev += s * dense[s];
-         }
-         for (const auto& [score, prob] : sparse) {
-             ev += score * prob;
-         }
-         return ev;
-     }
-     
-     // Total probability (should sum to 1.0)
-     float TotalProb() const {
-         float total = 0.0f;
-         for (float p : dense) total += p;
-         for (const auto& [score, prob] : sparse) total += prob;
-         return total;
-     }
-     
-     // Shift PMF by adding points (for convolution)
-     // Returns a new PMF where P'(s + points) = P(s)
-     PMF Shift(int points) const {
-         PMF result;
-         for (int s = 0; s <= DENSE_MAX; s++) {
-             if (dense[s] > PROB_THRESHOLD) {
-                 result.AddProb(s + points, dense[s]);
-             }
-         }
-         for (const auto& [score, prob] : sparse) {
-             result.AddProb(score + points, prob);
-         }
-         return result;
-     }
-     
-     // Add another PMF scaled by probability (for mixing distributions)
-     void AddScaled(const PMF& other, float scale) {
-         if (scale < PROB_THRESHOLD) return;
-         for (int s = 0; s <= DENSE_MAX; s++) {
-             if (other.dense[s] > PROB_THRESHOLD) {
-                 AddProb(s, other.dense[s] * scale);
-             }
-         }
-         for (const auto& [score, prob] : other.sparse) {
-             AddProb(score, prob * scale);
-         }
-     }
-     
-     // Debug print
-     void Print(int max_show = 20) const {
-         std::cout << "PMF (EV=" << std::fixed << std::setprecision(2) 
-                   << ExpectedValue() << ", total=" << TotalProb() << "):" << std::endl;
-         int shown = 0;
-         for (int s = 0; s <= DENSE_MAX && shown < max_show; s++) {
-             if (dense[s] > 0.001f) {
-                 std::cout << "  P(" << s << ") = " << dense[s] << std::endl;
-                 shown++;
-             }
-         }
-         for (const auto& [score, prob] : sparse) {
-             if (shown >= max_show) break;
-             if (prob > 0.001f) {
-                 std::cout << "  P(" << score << ") = " << prob << std::endl;
-                 shown++;
-             }
-         }
-     }
- };
- 
- // -------------------------------------------------------------------------
- // DICE INDEXER
- // -------------------------------------------------------------------------
- 
- class DiceIndexer {
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cerrno>
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <string>
+#include <vector>
+
+#include "yahtzee_exact_turn.h"
+
+const int DENSE_SIZE = MAX_FUTURE_SCORE + 1;  // 1576 scores: 0..1575
+
+// Output index entry
+struct PMFIndexEntry {
+  uint32_t offset;  // first float in the data section
+  int16_t lo;       // lowest score with nonzero probability
+  int16_t width;    // number of scores stored (0 = not computed)
+};
+static_assert(sizeof(PMFIndexEntry) == 8, "index entry must be 8 bytes");
+
+class ExactPMFSolver {
  public:
-     std::map<std::vector<int>, int> dice_to_id;
-     std::vector<std::vector<int>> id_to_dice;
-     
-     explicit DiceIndexer(int num_dice) {
-         std::vector<int> current;
-         Generate(current, 1, num_dice);
-     }
-     
-     int GetId(std::vector<int> dice) const {
-         std::sort(dice.begin(), dice.end());
-         return dice_to_id.at(dice);
-     }
-     
-     const std::vector<int>& GetDice(int id) const {
-         return id_to_dice[id];
-     }
-     
+  explicit ExactPMFSolver(bool low_memory);
+  ~ExactPMFSolver();
+  void Solve(const std::string& filename);
+  void WriteExactStart(const std::string& filename) const;
+
  private:
-     void Generate(std::vector<int>& current, int start, int depth) {
-         if ((int)current.size() == depth) {
-             dice_to_id[current] = id_to_dice.size();
-             id_to_dice.push_back(current);
-             return;
-         }
-         for (int i = start; i <= 6; i++) {
-             current.push_back(i);
-             Generate(current, i, depth);
-             current.pop_back();
-         }
-     }
- };
- 
- // -------------------------------------------------------------------------
- // SCORING FUNCTIONS
- // -------------------------------------------------------------------------
- 
- int GetSum(const std::vector<int>& dice) {
-     return std::accumulate(dice.begin(), dice.end(), 0);
- }
- 
- bool HasNOfAKind(const std::vector<int>& dice, int n) {
-     int counts[7] = {0};
-     for (int d : dice) counts[d]++;
-     for (int c : counts) if (c >= n) return true;
-     return false;
- }
- 
- bool IsFullHouse(const std::vector<int>& dice) {
-     int counts[7] = {0};
-     for (int d : dice) counts[d]++;
-     bool has3 = false, has2 = false;
-     for (int c : counts) {
-         if (c == 5) return true;
-         if (c == 3) has3 = true;
-         if (c == 2) has2 = true;
-     }
-     return has3 && has2;
- }
- 
- bool IsStraight(const std::vector<int>& dice, int len) {
-     int unique[7] = {0};
-     for (int d : dice) unique[d] = 1;
-     int consec = 0;
-     for (int i = 1; i <= 6; i++) {
-         if (unique[i]) consec++;
-         else consec = 0;
-         if (consec >= len) return true;
-     }
-     return false;
- }
- 
- int CalculateScore(int category, const std::vector<int>& dice) {
-     if (category < 6) {
-         return std::count(dice.begin(), dice.end(), category + 1) * (category + 1);
-     }
-     switch (category) {
-         case 6: return HasNOfAKind(dice, 3) ? GetSum(dice) : 0;
-         case 7: return HasNOfAKind(dice, 4) ? GetSum(dice) : 0;
-         case 8: return IsFullHouse(dice) ? 25 : 0;
-         case 9: return IsStraight(dice, 4) ? 30 : 0;
-         case 10: return IsStraight(dice, 5) ? 40 : 0;
-         case 11: return GetSum(dice);
-         case 12: return HasNOfAKind(dice, 5) ? 50 : 0;
-     }
-     return 0;
- }
- 
- // -------------------------------------------------------------------------
- // PMF SOLVER CLASS
- // -------------------------------------------------------------------------
- 
- class YahtzeePMFSolver {
- public:
-     YahtzeePMFSolver(const std::string& ev_file) : indexer_5_(5) {
-         LoadEVStrategy(ev_file);
-         InitDiceSubsets();
-         BuildTransitionMatrix();
-         AllocatePMFTables();
-     }
-     
-     void Solve();
-     void SaveToFile(const std::string& filename);
-     
-     // Query interface
-     const PMF& GetPMF(int mask, int upper, int y_state) const {
-         return board_pmf_[BoardIndex(mask, upper, y_state)];
-     }
- 
- private:
-     DiceIndexer indexer_5_;
-     
-     // Dice subsets and transitions (same as EV solver)
-     std::vector<std::vector<int>> all_subsets_dice_;
-     std::map<std::vector<int>, int> subset_to_id_;
-     std::vector<std::vector<float>> trans_probs_;
-     std::vector<std::vector<int>> valid_subsets_for_outcome_;
-     
-     // Loaded start-of-turn EVs (optimal actions are derived from these)
-     std::vector<float> board_ev_;
-     
-     // PMF tables
-     std::vector<PMF> board_pmf_;  // PMF at start of turn
-     
-     // Indexing
-     inline size_t BoardIndex(int mask, int upper, int y_state) const {
-         return (mask * MAX_UPPER_SCORE + upper) * NUM_Y_STATES + y_state;
-     }
-     
-     // EV accessors
-     float GetBoardEV(int mask, int upper, int y_state) const {
-         if (mask == (1 << 12) - 1 && y_state > 0) return 0.0f;
-         return board_ev_[BoardIndex(mask, upper, y_state)];
-     }
-     
-     void LoadEVStrategy(const std::string& filename);
-     void InitDiceSubsets();
-     void BuildTransitionMatrix();
-     void AllocatePMFTables();
-     
-     // Get optimal action and resulting state transition
-     struct ScoringResult {
-         int category;
-         int points;      // Immediate points scored
-         int next_mask;
-         int next_upper;
-         int next_y_state;
-     };
-     
-     ScoringResult GetOptimalScoringMove(int dice_id, int mask, int upper, int y_state) const;
- };
- 
- void YahtzeePMFSolver::LoadEVStrategy(const std::string& filename) {
-     std::cout << "Loading EV strategy from " << filename << "..." << std::flush;
-     
-     std::ifstream in(filename, std::ios::binary);
-     if (!in) {
-         throw std::runtime_error("Could not open EV strategy file");
-     }
-     
-     uint32_t magic, version, board_size, roll_size;
-     in.read(reinterpret_cast<char*>(&magic), sizeof(magic));
-     in.read(reinterpret_cast<char*>(&version), sizeof(version));
-     in.read(reinterpret_cast<char*>(&board_size), sizeof(board_size));
-     in.read(reinterpret_cast<char*>(&roll_size), sizeof(roll_size));
-     
-     // Version 4: board EVs only. Version 3: board EVs followed by mid-turn
-     // tables, which are not needed (keep decisions are recomputed below).
-     if (magic != 0x59414854 || (version != 3 && version != 4) ||
-         board_size != BOARD_STATE_SIZE) {
-         throw std::runtime_error("Invalid EV strategy file format");
-     }
-     
-     board_ev_.resize(board_size);
-     in.read(reinterpret_cast<char*>(board_ev_.data()), board_size * sizeof(float));
-     if (!in) {
-         throw std::runtime_error("Failed to read EV strategy file");
-     }
-     
-     std::cout << " done" << std::endl;
- }
- 
- void YahtzeePMFSolver::InitDiceSubsets() {
-     for (int i = 0; i <= 5; i++) {
-         DiceIndexer tmp(i);
-         for (const auto& d : tmp.id_to_dice) {
-             subset_to_id_[d] = all_subsets_dice_.size();
-             all_subsets_dice_.push_back(d);
-         }
-     }
- }
- 
- void YahtzeePMFSolver::BuildTransitionMatrix() {
-     std::cout << "Building transition matrix..." << std::flush;
-     
-     trans_probs_.assign(all_subsets_dice_.size(), 
-                         std::vector<float>(NUM_DICE_COMBOS, 0.0f));
-     
-     for (size_t i = 0; i < all_subsets_dice_.size(); i++) {
-         std::vector<int> kept = all_subsets_dice_[i];
-         int needed = 5 - kept.size();
-         long long total = 1;
-         for (int p = 0; p < needed; p++) total *= 6;
-         
-         for (long long j = 0; j < total; j++) {
-             std::vector<int> current = kept;
-             long long temp = j;
-             for (int r = 0; r < needed; r++) {
-                 current.push_back((temp % 6) + 1);
-                 temp /= 6;
-             }
-             int final_id = indexer_5_.GetId(current);
-             trans_probs_[i][final_id] += 1.0f;
-         }
-         
-         for (int d = 0; d < NUM_DICE_COMBOS; d++) {
-             trans_probs_[i][d] /= static_cast<float>(total);
-         }
-     }
-     
-     // Build valid subsets for each outcome
-     valid_subsets_for_outcome_.resize(NUM_DICE_COMBOS);
-     for (int d = 0; d < NUM_DICE_COMBOS; d++) {
-         std::vector<int> dice = indexer_5_.GetDice(d);
-         for (int m = 0; m < 32; m++) {
-             std::vector<int> sub;
-             for (int b = 0; b < 5; b++) {
-                 if ((m >> b) & 1) sub.push_back(dice[b]);
-             }
-             std::sort(sub.begin(), sub.end());
-             valid_subsets_for_outcome_[d].push_back(subset_to_id_[sub]);
-         }
-         std::sort(valid_subsets_for_outcome_[d].begin(), 
-                   valid_subsets_for_outcome_[d].end());
-         auto last = std::unique(valid_subsets_for_outcome_[d].begin(), 
-                                valid_subsets_for_outcome_[d].end());
-         valid_subsets_for_outcome_[d].erase(last, valid_subsets_for_outcome_[d].end());
-     }
-     
-     std::cout << " done" << std::endl;
- }
- 
- void YahtzeePMFSolver::AllocatePMFTables() {
-     std::cout << "Allocating PMF tables..." << std::flush;
-     board_pmf_.resize(BOARD_STATE_SIZE);
-     size_t mem_mb = BOARD_STATE_SIZE * DENSE_SIZE * sizeof(float) / (1024 * 1024);
-     std::cout << " done (" << mem_mb << " MB for dense part)" << std::endl;
- }
- 
- YahtzeePMFSolver::ScoringResult YahtzeePMFSolver::GetOptimalScoringMove(
-     int dice_id, int mask, int upper, int y_state) const {
-     
-     std::vector<int> dice = indexer_5_.GetDice(dice_id);
-     bool is_yahtzee = HasNOfAKind(dice, 5);
-     int yahtzee_num = is_yahtzee ? dice[0] : 0;
-     
-     ScoringResult best;
-     best.category = -1;
-     float max_val = -1e9f;
-     
-     // Special case: Yahtzee roll
-     if (is_yahtzee) {
-         if (y_state == 0) {
-             // Take Yahtzee
-             float val = 50.0f + GetBoardEV(mask, upper, 2);
-             if (val > max_val) {
-                 max_val = val;
-                 best.category = CAT_YAHTZEE;
-                 best.points = 50;
-                 best.next_mask = mask;
-                 best.next_upper = upper;
-                 best.next_y_state = 2;
-             }
-         } else {
-             // Joker rules
-             float bonus = (y_state == 2) ? 100.0f : 0.0f;
-             int upper_idx = yahtzee_num - 1;
-             bool upper_open = !((mask >> upper_idx) & 1);
-             
-             if (upper_open) {
-                 // Must play corresponding upper
-                 int score = CalculateScore(upper_idx, dice);
-                 int next_u = std::min(63, upper + score);
-                 float u_bonus = (upper < 63 && next_u >= 63) ? 35.0f : 0.0f;
-                 
-                 best.category = upper_idx;
-                 best.points = (int)(bonus + score + u_bonus);
-                 best.next_mask = mask | (1 << upper_idx);
-                 best.next_upper = next_u;
-                 best.next_y_state = y_state;
-                 return best;
-             } else {
-                 // Try lower section
-                 for (int c = 6; c < 12; c++) {
-                     if (!((mask >> c) & 1)) {
-                         int score = CalculateScore(c, dice);
-                         if (c == 8) score = 25;
-                         else if (c == 9) score = 30;
-                         else if (c == 10) score = 40;
-                         
-                         float val = bonus + score + GetBoardEV(mask | (1 << c), upper, y_state);
-                         if (val > max_val) {
-                             max_val = val;
-                             best.category = c;
-                             best.points = (int)(bonus + score);
-                             best.next_mask = mask | (1 << c);
-                             best.next_upper = upper;
-                             best.next_y_state = y_state;
-                         }
-                     }
-                 }
-                 
-                 // If no lower, use upper for 0
-                 if (best.category < 0) {
-                     for (int c = 0; c < 6; c++) {
-                         if (!((mask >> c) & 1)) {
-                             float val = bonus + GetBoardEV(mask | (1 << c), upper, y_state);
-                             if (val > max_val) {
-                                 max_val = val;
-                                 best.category = c;
-                                 best.points = (int)bonus;
-                                 best.next_mask = mask | (1 << c);
-                                 best.next_upper = upper;
-                                 best.next_y_state = y_state;
-                             }
-                         }
-                     }
-                 }
-             }
-             return best;
-         }
-     }
-     
-     // Standard case: try all open categories
-     for (int c = 0; c < 12; c++) {
-         if (!((mask >> c) & 1)) {
-             int score = CalculateScore(c, dice);
-             int next_u = upper;
-             float u_bonus = 0.0f;
-             
-             if (c < 6) {
-                 next_u = std::min(63, upper + score);
-                 if (upper < 63 && next_u >= 63) u_bonus = 35.0f;
-             }
-             
-             float val = score + u_bonus + GetBoardEV(mask | (1 << c), next_u, y_state);
-             if (val > max_val) {
-                 max_val = val;
-                 best.category = c;
-                 best.points = score + (int)u_bonus;
-                 best.next_mask = mask | (1 << c);
-                 best.next_upper = next_u;
-                 best.next_y_state = y_state;
-             }
-         }
-     }
-     
-     // Yahtzee category with non-Yahtzee roll
-     if (y_state == 0) {
-         float val = GetBoardEV(mask, upper, 1);
-         if (val > max_val) {
-             max_val = val;
-             best.category = CAT_YAHTZEE;
-             best.points = 0;
-             best.next_mask = mask;
-             best.next_upper = upper;
-             best.next_y_state = 1;
-         }
-     }
-     
-     return best;
- }
- 
- void YahtzeePMFSolver::Solve() {
-     std::cout << "\nStarting PMF computation (reverse induction)...\n" << std::endl;
+  ScoringRules rules_;
+  KeepLattice lattice_;
+  u64 init_count_[NUM_DICE_COMBOS];  // ordered ways to roll each outcome
 
-     for (int total_filled = 13; total_filled >= 0; --total_filled) {
-         auto start_time = std::chrono::high_resolution_clock::now();
-         std::cout << "Processing states with " << total_filled
-                   << " categories filled..." << std::flush;
+  std::vector<u64> ev_;           // EV numerators, EV_LIMBS per board
+  std::vector<int16_t> lo_, hi_;  // score range per board
 
-         // Flatten (mask, y_state, upper) for this fill level into one list
-         // so OpenMP can parallelize all of them in one loop.
-         std::vector<std::tuple<int,int,int>> jobs;
-         jobs.reserve(4096 * 64 * 3);
-         for (int m = 0; m < (1 << 12); m++) {
-             int mc = __builtin_popcount(m);
-             for (int u = 0; u < MAX_UPPER_SCORE; u++) {
-                 if (mc == total_filled)
-                     jobs.emplace_back(m, u, 0);
-                 if (mc + 1 == total_filled) {
-                     jobs.emplace_back(m, u, 1);
-                     jobs.emplace_back(m, u, 2);
-                 }
-             }
-         }
+  // Packed distribution layout: ceil(width / 8) words holding one limb count
+  // per score (one byte each), then each score's limbs, high zero limbs
+  // dropped (a zero probability takes no limbs).
+  static int LensWords(int width) { return (width + 7) / 8; }
 
-         struct FinalResult { int points; size_t next_idx; };
+  // Exact layers: in RAM (mem_), or in temporary files (low-memory mode)
+  const bool low_memory_;
+  std::vector<std::vector<u64>> mem_;  // packed distribution per board
+  std::vector<u64> off_;               // low-memory: word offset in layer file
+  std::string layer_path_[2];
+  int cur_fd_ = -1;                    // layer file being written
+  std::atomic<size_t> cur_words_{0};
+  const u64* prev_ = nullptr;          // memory-mapped previous layer
+  size_t prev_bytes_ = 0;
+  int prev_slot_ = 0;
 
-         // Three-pass PMF accumulation with thread-private buffers (booty-dice pattern).
-         // Each pass is a 252×nonzero×401 matrix product — ~125× faster than 252³ loop.
-         #pragma omp parallel
-         {
-             // Per-thread heap buffers: [outcome][score_entry] = 252×401 floats = 404 KB each.
-             std::vector<float> shifted_buf(NUM_DICE_COMBOS * DENSE_SIZE, 0.0f);
-             std::vector<float> pmf2_buf(NUM_DICE_COMBOS * DENSE_SIZE, 0.0f);
-             std::vector<float> pmf1_buf(NUM_DICE_COMBOS * DENSE_SIZE, 0.0f);
+  // Float rows are appended to a temporary file as states finish (in thread
+  // order); WriteOutput then copies them in board-index order, so the output
+  // file is byte-for-byte reproducible without holding rows in memory.
+  int rows_fd_ = -1;
+  std::string rows_path_;
+  std::vector<PMFIndexEntry> index_;  // offsets into the rows file until output
+  std::atomic<size_t> row_floats_{0};
+  void WriteOutput(const std::string& filename);
 
-             #pragma omp for schedule(dynamic, 4)
-             for (int ji = 0; ji < (int)jobs.size(); ji++) {
-                 auto [mask, upper, y_state] = jobs[ji];
-                 PMF& pmf = board_pmf_[BoardIndex(mask, upper, y_state)];
-                 pmf.Clear();
+  // Packed distribution of a board in the previous layer
+  const u64* Packed(size_t idx) const {
+    return low_memory_ ? prev_ + off_[idx] : mem_[idx].data();
+  }
 
-                 if (mask == (1 << 12) - 1 && y_state > 0) {
-                     pmf.SetProb(0, 1.0f);
-                     continue;
-                 }
+  // Stores a finished distribution (exact, packed) and its float row
+  void Emit(size_t idx, int lo, const std::vector<u64>& packed,
+            const float* row, int width);
 
-                 // --- Precompute keep decisions via dot products (keep2 fix) ---
-                 int keep1_for[NUM_DICE_COMBOS], keep2_for[NUM_DICE_COMBOS];
-                 FinalResult final_res[NUM_DICE_COMBOS];
+  // Layer bookkeeping (low-memory mode: file per layer)
+  void StartLayer(int slot);
+  void FinishLayer(int slot, const std::vector<size_t>& older_states);
 
-                 for (int d = 0; d < NUM_DICE_COMBOS; d++) {
-                     auto r = GetOptimalScoringMove(d, mask, upper, y_state);
-                     final_res[d] = {r.points,
-                                     BoardIndex(r.next_mask, r.next_upper, r.next_y_state)};
-                 }
+  // Probabilities of the five-dice outcomes after one reroll decision:
+  // out[d] = sum over a[d1] * P(d | keep[d1]), scaled to a total of 6^5 * sum(a)
+  void PushWeights(const u64* a, const int16_t* keep, u64* out) const;
 
-                 float term_ev[NUM_DICE_COMBOS];
-                 for (int d = 0; d < NUM_DICE_COMBOS; d++)
-                     term_ev[d] = final_res[d].points + board_ev_[final_res[d].next_idx];
+  template <int L>
+  void SolveLayer(const std::vector<size_t>& states, int turns_left);
 
-                 // Keep with one roll left: maximise E[term_ev]; this also
-                 // gives roll2_ev[d], the value of outcome d with one roll left
-                 const int NUM_SUBSETS = 462;
-                 float subset_ev[NUM_SUBSETS];
-                 float subset_roll2_ev[NUM_SUBSETS];
-                 float roll2_ev[NUM_DICE_COMBOS];
-                 for (int sid = 0; sid < NUM_SUBSETS; sid++) {
-                     const auto& probs = trans_probs_[sid];
-                     float ev2 = 0.0f;
-                     for (int d = 0; d < NUM_DICE_COMBOS; d++) ev2 += probs[d] * term_ev[d];
-                     subset_ev[sid] = ev2;
-                 }
-                 for (int d = 0; d < NUM_DICE_COMBOS; d++) {
-                     float best2 = -1e9f;
-                     int sid2 = 0;
-                     for (int sid : valid_subsets_for_outcome_[d]) {
-                         if (subset_ev[sid] > best2) { best2 = subset_ev[sid]; sid2 = sid; }
-                     }
-                     keep2_for[d] = sid2;
-                     roll2_ev[d] = best2;
-                 }
+  static void WriteAt(int fd, size_t offset, const void* data, size_t bytes);
 
-                 // Keep with two rolls left: maximise E[roll2_ev]
-                 for (int sid = 0; sid < NUM_SUBSETS; sid++) {
-                     const auto& probs = trans_probs_[sid];
-                     float ev1 = 0.0f;
-                     for (int d = 0; d < NUM_DICE_COMBOS; d++) ev1 += probs[d] * roll2_ev[d];
-                     subset_roll2_ev[sid] = ev1;
-                 }
-                 for (int d = 0; d < NUM_DICE_COMBOS; d++) {
-                     float best1 = -1e9f;
-                     int sid1 = 0;
-                     for (int sid : valid_subsets_for_outcome_[d]) {
-                         if (subset_roll2_ev[sid] > best1) { best1 = subset_roll2_ev[sid]; sid1 = sid; }
-                     }
-                     keep1_for[d] = sid1;
-                 }
+  // Reachable boards with exactly turns_left turns to go
+  std::vector<size_t> Layer(int turns_left) const;
+};
 
-                 // --- Pass 0: shifted[r3][s] = board_pmf_[next[r3]].dense[s - pts[r3]] ---
-                 std::fill(shifted_buf.begin(), shifted_buf.end(), 0.0f);
-                 for (int r3 = 0; r3 < NUM_DICE_COMBOS; r3++) {
-                     const PMF& fut = board_pmf_[final_res[r3].next_idx];
-                     int pts = final_res[r3].points;
-                     float* row = shifted_buf.data() + r3 * DENSE_SIZE;
-                     for (int s = 0; s <= DENSE_MAX; s++) {
-                         int ns = s + pts;
-                         if (ns <= DENSE_MAX) row[ns] = fut.dense[s];
-                     }
-                 }
+ExactPMFSolver::ExactPMFSolver(bool low_memory)
+    : ev_(static_cast<size_t>(BOARD_STATE_SIZE) * EV_LIMBS, 0),
+      lo_(BOARD_STATE_SIZE, 0),
+      hi_(BOARD_STATE_SIZE, -1),
+      low_memory_(low_memory),
+      index_(BOARD_STATE_SIZE, PMFIndexEntry{0, 0, 0}) {
+  if (low_memory_) {
+    off_.assign(BOARD_STATE_SIZE, 0);
+  } else {
+    mem_.resize(BOARD_STATE_SIZE);
+  }
+  // Rolling all five dice: a single unit kept as the empty subset, pushed
+  // through the lattice, gives the ordered counts of each outcome
+  u64 one[NUM_DICE_COMBOS] = {0};
+  int16_t keep_empty[NUM_DICE_COMBOS] = {0};
+  one[0] = 1;
+  PushWeights(one, keep_empty, init_count_);
+}
 
-                 // --- Pass 1: pmf2[r2][s] = Σ_r3 trans[keep2_for[r2]][r3] × shifted[r3][s] ---
-                 std::fill(pmf2_buf.begin(), pmf2_buf.end(), 0.0f);
-                 for (int r2 = 0; r2 < NUM_DICE_COMBOS; r2++) {
-                     const float* trans2 = trans_probs_[keep2_for[r2]].data();
-                     float* out = pmf2_buf.data() + r2 * DENSE_SIZE;
-                     for (int r3 = 0; r3 < NUM_DICE_COMBOS; r3++) {
-                         float p = trans2[r3];
-                         if (p < PROB_THRESHOLD) continue;
-                         const float* in = shifted_buf.data() + r3 * DENSE_SIZE;
-                         for (int s = 0; s <= DENSE_MAX; s++) out[s] += p * in[s];
-                     }
-                 }
+ExactPMFSolver::~ExactPMFSolver() {
+  if (prev_) {
+    munmap(const_cast<u64*>(prev_), prev_bytes_);
+    unlink(layer_path_[prev_slot_].c_str());
+  }
+}
 
-                 // --- Pass 2: pmf1[r1][s] = Σ_r2 trans[keep1_for[r1]][r2] × pmf2[r2][s] ---
-                 std::fill(pmf1_buf.begin(), pmf1_buf.end(), 0.0f);
-                 for (int r1 = 0; r1 < NUM_DICE_COMBOS; r1++) {
-                     const float* trans1 = trans_probs_[keep1_for[r1]].data();
-                     float* out = pmf1_buf.data() + r1 * DENSE_SIZE;
-                     for (int r2 = 0; r2 < NUM_DICE_COMBOS; r2++) {
-                         float p = trans1[r2];
-                         if (p < PROB_THRESHOLD) continue;
-                         const float* in = pmf2_buf.data() + r2 * DENSE_SIZE;
-                         for (int s = 0; s <= DENSE_MAX; s++) out[s] += p * in[s];
-                     }
-                 }
+void ExactPMFSolver::PushWeights(const u64* a, const int16_t* keep, u64* out) const {
+  static const u64 kPow6[6] = {1, 6, 36, 216, 1296, 7776};
+  u64 M[KeepLattice::kNumSubsets] = {0};
+  for (int d = 0; d < NUM_DICE_COMBOS; ++d) {
+    if (a[d]) M[keep[d]] += a[d] * kPow6[lattice_.Size(keep[d])];
+  }
+  // Ids ascend by size, so each subset is complete before it is pushed
+  for (int i = 0; i < KeepLattice::kFirst5; ++i) {
+    if (!M[i]) continue;
+    for (int child : lattice_.Children(i)) M[child] += M[i];
+  }
+  for (int d = 0; d < NUM_DICE_COMBOS; ++d) out[d] = M[KeepLattice::kFirst5 + d];
+}
 
-                 // --- Pass 3: result[s] = Σ_r1 init[r1] × pmf1[r1][s] ---
-                 const float* init_p = trans_probs_[0].data();
-                 for (int r1 = 0; r1 < NUM_DICE_COMBOS; r1++) {
-                     float p = init_p[r1];
-                     if (p < PROB_THRESHOLD) continue;
-                     const float* in = pmf1_buf.data() + r1 * DENSE_SIZE;
-                     for (int s = 0; s <= DENSE_MAX; s++) pmf.dense[s] += p * in[s];
-                 }
+std::vector<size_t> ExactPMFSolver::Layer(int turns_left) const {
+  std::vector<size_t> states;
+  for (int m = 0; m < NUM_BOARD_MASKS; ++m) {
+    for (int y = 0; y < NUM_Y_STATES; ++y) {
+      if (TurnsLeft(m, y) != turns_left) continue;
+      for (int u = 0; u < MAX_UPPER_SCORE; ++u) {
+        if (rules_.Reachable(m, u)) states.push_back(BoardStateIndex(m, u, y));
+      }
+    }
+  }
+  return states;
+}
 
-                 // Sparse correction: scores > DENSE_MAX from Yahtzee bonus chains.
-                 // Uses triple loop but only executes for the rare states that have them.
-                 bool has_sparse = false;
-                 for (int r3 = 0; r3 < NUM_DICE_COMBOS && !has_sparse; r3++)
-                     has_sparse = !board_pmf_[final_res[r3].next_idx].sparse.empty();
-                 if (has_sparse) {
-                     for (int r1 = 0; r1 < NUM_DICE_COMBOS; r1++) {
-                         float p1 = init_p[r1];
-                         if (p1 < PROB_THRESHOLD) continue;
-                         const float* tr1 = trans_probs_[keep1_for[r1]].data();
-                         for (int r2 = 0; r2 < NUM_DICE_COMBOS; r2++) {
-                             float p12 = p1 * tr1[r2];
-                             if (p12 < PROB_THRESHOLD) continue;
-                             const float* tr2 = trans_probs_[keep2_for[r2]].data();
-                             for (int r3 = 0; r3 < NUM_DICE_COMBOS; r3++) {
-                                 float tp = p12 * tr2[r3];
-                                 if (tp < PROB_THRESHOLD) continue;
-                                 const PMF& fut = board_pmf_[final_res[r3].next_idx];
-                                 if (fut.sparse.empty()) continue;
-                                 int pts = final_res[r3].points;
-                                 for (const auto& [sc, prob] : fut.sparse)
-                                     pmf.sparse[sc + pts] += prob * tp;
-                             }
-                         }
-                     }
-                 }
-             }
-         }
+void ExactPMFSolver::WriteAt(int fd, size_t offset, const void* data, size_t bytes) {
+  const char* p = static_cast<const char*>(data);
+  while (bytes > 0) {
+    ssize_t n = pwrite(fd, p, bytes, static_cast<off_t>(offset));
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      std::perror("FATAL: pwrite failed");
+      std::exit(1);
+    }
+    p += n;
+    offset += n;
+    bytes -= n;
+  }
+}
 
-         auto end_time = std::chrono::high_resolution_clock::now();
-         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-             end_time - start_time).count();
-         std::cout << " (" << ms << " ms, " << jobs.size() << " states)" << std::endl;
-     }
+void ExactPMFSolver::Emit(size_t idx, int lo, const std::vector<u64>& packed,
+                          const float* row, int width) {
+  // Exact distribution, for the next layer
+  if (low_memory_) {
+    size_t pos = cur_words_.fetch_add(packed.size());
+    WriteAt(cur_fd_, pos * sizeof(u64), packed.data(), packed.size() * sizeof(u64));
+    off_[idx] = pos;
+  } else {
+    mem_[idx] = packed;
+  }
+  // Float probabilities, to the rows file
+  size_t pos = row_floats_.fetch_add(width);
+  WriteAt(rows_fd_, pos * sizeof(float), row, width * sizeof(float));
+  index_[idx] = {static_cast<uint32_t>(pos), static_cast<int16_t>(lo),
+                 static_cast<int16_t>(width)};
+  lo_[idx] = static_cast<int16_t>(lo);
+  hi_[idx] = static_cast<int16_t>(lo + width - 1);
+}
 
-     std::cout << "\nPMF computation complete!" << std::endl;
+void ExactPMFSolver::WriteOutput(const std::string& filename) {
+  int fd = open(filename.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+  if (fd < 0) {
+    std::perror("FATAL: could not create output file");
+    std::exit(1);
+  }
+  const size_t data_offset = 16 + sizeof(PMFIndexEntry) * index_.size();
+  const size_t rows_bytes = row_floats_ * sizeof(float);
+  void* map = mmap(nullptr, rows_bytes, PROT_READ, MAP_SHARED, rows_fd_, 0);
+  if (map == MAP_FAILED) {
+    std::perror("FATAL: mmap failed");
+    std::exit(1);
+  }
+  const float* rows = static_cast<const float*>(map);
+  const size_t kChunk = 8 << 20;  // floats per write
+  std::vector<float> buf;
+  buf.reserve(kChunk + DENSE_SIZE);
+  size_t out_pos = 0, buf_start = 0;
+  for (size_t idx = 0; idx < index_.size(); ++idx) {
+    PMFIndexEntry& e = index_[idx];
+    if (e.width == 0) continue;
+    buf.insert(buf.end(), rows + e.offset, rows + e.offset + e.width);
+    e.offset = static_cast<uint32_t>(out_pos);
+    out_pos += e.width;
+    if (buf.size() >= kChunk) {
+      WriteAt(fd, data_offset + buf_start * sizeof(float), buf.data(), buf.size() * sizeof(float));
+      buf_start = out_pos;
+      buf.clear();
+    }
+  }
+  WriteAt(fd, data_offset + buf_start * sizeof(float), buf.data(), buf.size() * sizeof(float));
 
-     const PMF& start_pmf = board_pmf_[BoardIndex(0, 0, 0)];
-     std::cout << "\nVerification:" << std::endl;
-     std::cout << "  PMF expected value at start: " << start_pmf.ExpectedValue() << std::endl;
-     std::cout << "  EV strategy value at start:  " << GetBoardEV(0, 0, 0) << std::endl;
-     std::cout << "  PMF total probability: " << start_pmf.TotalProb() << std::endl;
- }
- 
- void YahtzeePMFSolver::SaveToFile(const std::string& filename) {
-     std::cout << "\nSaving PMF to " << filename << "..." << std::endl;
-     
-     std::ofstream out(filename, std::ios::binary);
-     if (!out) {
-         std::cerr << "Error: Could not open file for writing" << std::endl;
-         return;
-     }
-     
-     // Header
-     uint32_t magic = 0x504D4659;  // "PMFY"
-     uint32_t version = 1;
-     uint32_t num_states = BOARD_STATE_SIZE;
-     uint32_t dense_size = DENSE_SIZE;
-     
-     out.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
-     out.write(reinterpret_cast<const char*>(&version), sizeof(version));
-     out.write(reinterpret_cast<const char*>(&num_states), sizeof(num_states));
-     out.write(reinterpret_cast<const char*>(&dense_size), sizeof(dense_size));
-     
-     // Write dense parts
-     for (const auto& pmf : board_pmf_) {
-         out.write(reinterpret_cast<const char*>(pmf.dense.data()), 
-                   DENSE_SIZE * sizeof(float));
-     }
-     
-     // Write sparse parts (count + pairs)
-     for (const auto& pmf : board_pmf_) {
-         uint32_t sparse_count = pmf.sparse.size();
-         out.write(reinterpret_cast<const char*>(&sparse_count), sizeof(sparse_count));
-         for (const auto& [score, prob] : pmf.sparse) {
-             int32_t s = score;
-             out.write(reinterpret_cast<const char*>(&s), sizeof(s));
-             out.write(reinterpret_cast<const char*>(&prob), sizeof(prob));
-         }
-     }
-     
-     out.close();
-     std::cout << "PMF saved successfully" << std::endl;
- }
- 
- // -------------------------------------------------------------------------
- // MAIN
- // -------------------------------------------------------------------------
- 
- /*
-  * PERFORMANCE NOTE:
-  * =================
-  * The current implementation has O(252^3) = 16M iterations per state for the
-  * triple-nested roll loop. With 786K states, this is ~10^13 operations total.
-  * 
-  * Optimizations to consider:
-  * 1. Precompute "turn outcome distribution" for each (mask, upper, y_state)
-  *    This is a distribution over (points_scored, next_state) pairs.
-  *    Can be computed once and reused.
-  * 
-  * 2. Use sparse representation - most dice outcomes have very low probability
-  *    after the keep decisions. Could threshold at 1e-6 or so.
-  * 
-  * 3. Parallelize with OpenMP (add #pragma omp parallel for)
-  * 
-  * 4. Memoize the turn PMF computation - many states share similar structure.
-  * 
-  * Current estimate: ~10-30 minutes without optimization, ~1-5 min with OpenMP.
-  */
- 
- int main(int argc, char* argv[]) {
-     std::cout << "=== Yahtzee PMF Solver ===" << std::endl;
-     std::cout << "Computes probability distribution of future scores\n" << std::endl;
-     
-     std::string ev_file = "yahtzee_optimal_v4.bin";
-     if (argc > 1) {
-         ev_file = argv[1];
-     }
-     
-     auto start_time = std::chrono::high_resolution_clock::now();
-     
-     try {
-         YahtzeePMFSolver solver(ev_file);
-         solver.Solve();
-         solver.SaveToFile("yahtzee_pmf_v1.bin");
-         
-         // Print some example PMFs
-         std::cout << "\n=== Example PMFs ===" << std::endl;
-         
-         std::cout << "\nStart of game (mask=0, upper=0, y_state=0):" << std::endl;
-         solver.GetPMF(0, 0, 0).Print(15);
-         
-     } catch (const std::exception& e) {
-         std::cerr << "Error: " << e.what() << std::endl;
-         return 1;
-     }
-     
-     auto end_time = std::chrono::high_resolution_clock::now();
-     auto duration = std::chrono::duration_cast<std::chrono::seconds>(
-         end_time - start_time).count();
-     
-     std::cout << "\nTotal time: " << duration << " seconds" << std::endl;
-     
-     return 0;
- }
+  uint32_t header[4] = {0x504D4659,  // "PMFY"
+                        2, static_cast<uint32_t>(BOARD_STATE_SIZE),
+                        static_cast<uint32_t>(DENSE_SIZE)};
+  WriteAt(fd, 0, header, sizeof(header));
+  WriteAt(fd, sizeof(header), index_.data(), index_.size() * sizeof(PMFIndexEntry));
+  if (close(fd) != 0) {
+    std::perror("FATAL: close failed");
+    std::exit(1);
+  }
+  munmap(map, rows_bytes);
+  close(rows_fd_);
+  rows_fd_ = -1;
+  unlink(rows_path_.c_str());
+  std::cout << "Wrote " << filename << " ("
+            << (data_offset + out_pos * sizeof(float)) / (1024 * 1024) << " MB)" << std::endl;
+}
+
+void ExactPMFSolver::StartLayer(int slot) {
+  if (!low_memory_) return;
+  cur_fd_ = open(layer_path_[slot].c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
+  if (cur_fd_ < 0) {
+    std::perror("FATAL: could not create layer file");
+    std::exit(1);
+  }
+  cur_words_ = 0;
+}
+
+void ExactPMFSolver::FinishLayer(int slot, const std::vector<size_t>& older_states) {
+  if (!low_memory_) {
+    // The layer before the one just finished is no longer needed
+    for (size_t idx : older_states) std::vector<u64>().swap(mem_[idx]);
+    return;
+  }
+  // Drop the previous layer's file, then map the layer just written
+  if (prev_) {
+    munmap(const_cast<u64*>(prev_), prev_bytes_);
+    unlink(layer_path_[1 - slot].c_str());
+  }
+  prev_bytes_ = cur_words_ * sizeof(u64);
+  void* p = mmap(nullptr, prev_bytes_, PROT_READ, MAP_SHARED, cur_fd_, 0);
+  if (p == MAP_FAILED) {
+    std::perror("FATAL: mmap failed");
+    std::exit(1);
+  }
+  close(cur_fd_);
+  cur_fd_ = -1;
+  prev_ = static_cast<const u64*>(p);
+  prev_slot_ = slot;
+}
+
+template <int L>
+void ExactPMFSolver::SolveLayer(const std::vector<size_t>& states, int turns_left) {
+  ExactTurnSolver<L> turn(rules_, lattice_, turns_left, ev_.data());
+
+  // D_k = 6^(15k), exactly and as a long double
+  UInt<L> denom;
+  SetSmall(denom, 1);
+  long double inv_denom = 1.0L;
+  for (int t = 0; t < 15 * turns_left; ++t) {
+    MulSmall(denom, denom, 6);
+    inv_denom /= 6.0L;
+  }
+  const u64 kTurnTotal = 470184984576ULL;  // 6^15
+
+  #pragma omp parallel
+  {
+    std::vector<ExactTurnScratch<L>> scratch(1);
+    std::vector<UInt<L>> acc(DENSE_SIZE);
+    std::vector<float> row(DENSE_SIZE);
+    std::vector<int> lens_of(DENSE_SIZE);
+    std::vector<u64> packed;
+    TurnPolicy pol;
+    u64 w2[NUM_DICE_COMBOS], w3[NUM_DICE_COMBOS];
+    struct Pair { u64 key; u64 weight; };
+    std::vector<Pair> pairs;
+    pairs.reserve(NUM_DICE_COMBOS);
+
+    #pragma omp for schedule(dynamic, 4)
+    for (size_t si = 0; si < states.size(); ++si) {
+      const size_t idx = states[si];
+      const int y_state = static_cast<int>(idx % NUM_Y_STATES);
+      const int upper = static_cast<int>((idx / NUM_Y_STATES) % MAX_UPPER_SCORE);
+      const int mask = static_cast<int>(idx / (NUM_Y_STATES * MAX_UPPER_SCORE));
+
+      // Exact EV and optimal policy
+      UInt<L> ev;
+      turn.Solve(mask, upper, y_state, scratch[0], ev, &pol);
+      Store(&ev_[EV_LIMBS * idx], ev, EV_LIMBS);
+
+      // Probability of each final roll (integers over 6^15)
+      PushWeights(init_count_, pol.keep1, w2);
+      PushWeights(w2, pol.keep2, w3);
+
+      // Merge final rolls by (points, next board)
+      pairs.clear();
+      u64 total = 0;
+      for (int d = 0; d < NUM_DICE_COMBOS; ++d) {
+        if (!w3[d]) continue;
+        total += w3[d];
+        pairs.push_back({(static_cast<u64>(pol.reward[d]) << 32) | pol.next_idx[d], w3[d]});
+      }
+      if (total != kTurnTotal) {
+        std::cerr << "FATAL: turn probabilities sum to " << total << std::endl;
+        std::exit(1);
+      }
+      std::sort(pairs.begin(), pairs.end(),
+                [](const Pair& a, const Pair& b) { return a.key < b.key; });
+      size_t np = 0;
+      for (size_t i = 0; i < pairs.size(); ++i) {
+        if (np && pairs[np - 1].key == pairs[i].key) {
+          pairs[np - 1].weight += pairs[i].weight;
+        } else {
+          pairs[np++] = pairs[i];
+        }
+      }
+      pairs.resize(np);
+
+      // Score range
+      int lo = DENSE_SIZE, hi = -1;
+      for (const Pair& p : pairs) {
+        int r = static_cast<int>(p.key >> 32);
+        size_t n = p.key & 0xffffffffULL;
+        lo = std::min(lo, r + lo_[n]);
+        hi = std::max(hi, r + hi_[n]);
+      }
+      const int width = hi - lo + 1;
+
+      // PMF_k[s] = sum of w * PMF_{k-1}[n][s - r]
+      for (int j = 0; j < width; ++j) SetZero(acc[j]);
+      for (const Pair& p : pairs) {
+        int r = static_cast<int>(p.key >> 32);
+        size_t n = p.key & 0xffffffffULL;
+        const int base = r + lo_[n] - lo;
+        const int cnt = hi_[n] - lo_[n] + 1;
+        const uint8_t* lens = reinterpret_cast<const uint8_t*>(Packed(n));
+        const u64* src = Packed(n) + LensWords(cnt);
+        for (int j = 0; j < cnt; ++j) {
+          const int len = lens[j];
+          if (len) MulAddSmall(acc[base + j], src, len, p.weight);
+          src += len;
+        }
+      }
+
+      // Exact checks: total probability 1, mean equals the exact EV
+      UInt<L> sum, mean, t;
+      SetZero(sum);
+      SetZero(mean);
+      for (int j = 0; j < width; ++j) {
+        AddTo(sum, acc[j]);
+        MulSmall(t, acc[j], static_cast<u64>(lo + j));
+        AddTo(mean, t);
+      }
+      if (!Equal(sum, denom) || !Equal(mean, ev)) {
+        std::cerr << "FATAL: exact check failed at board " << idx
+                  << (Equal(sum, denom) ? " (mean != EV)" : " (sum != 1)") << std::endl;
+        std::exit(1);
+      }
+
+      // Pack the exact distribution and round each probability to float
+      size_t words = LensWords(width);
+      for (int j = 0; j < width; ++j) {
+        int len = L;
+        while (len > 0 && acc[j].w[len - 1] == 0) --len;
+        lens_of[j] = len;
+        words += len;
+      }
+      packed.assign(words, 0);
+      uint8_t* lens = reinterpret_cast<uint8_t*>(packed.data());
+      u64* dst = packed.data() + LensWords(width);
+      for (int j = 0; j < width; ++j) {
+        const int len = lens_of[j];
+        lens[j] = static_cast<uint8_t>(len);
+        for (int i = 0; i < len; ++i) *dst++ = acc[j].w[i];
+        row[j] = static_cast<float>(ToLongDouble(acc[j].w, len) * inv_denom);
+      }
+      Emit(idx, lo, packed, row.data(), width);
+    }
+  }
+}
+
+void ExactPMFSolver::Solve(const std::string& filename) {
+  rows_path_ = filename + ".rows";
+  rows_fd_ = open(rows_path_.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
+  if (rows_fd_ < 0) {
+    std::perror("FATAL: could not create rows file");
+    std::exit(1);
+  }
+  layer_path_[0] = filename + ".layer0";
+  layer_path_[1] = filename + ".layer1";
+
+  std::cout << "Starting exact PMF computation (reverse induction"
+            << (low_memory_ ? ", low-memory mode" : "") << ")...\n" << std::endl;
+
+  // Terminal boards: nothing more to score
+  std::vector<size_t> prev = Layer(0), older;
+  StartLayer(0);
+  {
+    const std::vector<u64> certain = {1, 1};  // one score (0), one limb, numerator 1
+    const float one = 1.0f;
+    for (size_t idx : prev) Emit(idx, 0, certain, &one, 1);
+  }
+  FinishLayer(0, older);
+
+  for (int turns_left = 1; turns_left <= 13; ++turns_left) {
+    auto start = std::chrono::high_resolution_clock::now();
+    std::vector<size_t> states = Layer(turns_left);
+    int limbs = EvLimbs(turns_left);
+    std::cout << "Layer " << std::setw(2) << 13 - turns_left << " filled ("
+              << std::setw(6) << states.size() << " states, " << limbs
+              << " limbs)..." << std::flush;
+
+    const int slot = turns_left % 2;
+    StartLayer(slot);
+    switch (limbs) {
+      case 1: SolveLayer<1>(states, turns_left); break;
+      case 2: SolveLayer<2>(states, turns_left); break;
+      case 3: SolveLayer<3>(states, turns_left); break;
+      case 4: SolveLayer<4>(states, turns_left); break;
+      case 5: SolveLayer<5>(states, turns_left); break;
+      case 6: SolveLayer<6>(states, turns_left); break;
+      case 7: SolveLayer<7>(states, turns_left); break;
+      case 8: SolveLayer<8>(states, turns_left); break;
+      case 9: SolveLayer<9>(states, turns_left); break;
+      default:
+        std::cerr << "FATAL: unsupported limb count " << limbs << std::endl;
+        std::exit(1);
+    }
+    size_t layer_bytes = cur_words_ * sizeof(u64);
+    if (!low_memory_) {
+      for (size_t idx : states) layer_bytes += mem_[idx].size() * sizeof(u64);
+    }
+    older.swap(prev);
+    prev.swap(states);
+    FinishLayer(slot, older);
+
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::high_resolution_clock::now() - start).count();
+    std::cout << " (" << ms << " ms, " << layer_bytes / (1024 * 1024)
+              << " MB exact)" << std::endl;
+  }
+
+  std::cout << "\nPMF computation complete! Every state passed the exact checks"
+            << " (sum = 1, mean = EV)." << std::endl;
+  WriteOutput(filename);
+}
+
+void ExactPMFSolver::WriteExactStart(const std::string& filename) const {
+  const size_t start = BoardStateIndex(0, 0, 0);
+  const int lo = lo_[start], hi = hi_[start];
+  const uint8_t* lens = reinterpret_cast<const uint8_t*>(Packed(start));
+  const u64* num = Packed(start) + LensWords(hi - lo + 1);
+
+  BigUInt den(1);
+  for (int i = 0; i < 195; ++i) den.MulSmall(6);
+
+  std::ofstream out(filename);
+  out << "# Exact distribution of the final Yahtzee score under the EV-optimal policy\n"
+      << "# (solo game, same rules as yahtzee_rules.h)\n"
+      << "# P(score = s) = numerator / 6^195\n"
+      << "# 6^195 = " << den.ToDecimal() << "\n"
+      << "# score numerator\n";
+
+  // Summary: exact mean, and a few probabilities in decimal
+  long double inv = 1.0L;
+  for (int i = 0; i < 195; ++i) inv /= 6.0L;
+  long double tail[5] = {0, 0, 0, 0, 0};
+  const int thresholds[5] = {200, 250, 300, 400, 500};
+  int mode = lo;
+  long double mode_p = -1;
+  for (int s = lo; s <= hi; ++s) {
+    const int len = lens[s - lo];
+    long double p = ToLongDouble(num, len) * inv;
+    for (int t = 0; t < 5; ++t) if (s >= thresholds[t]) tail[t] += p;
+    if (p > mode_p) { mode_p = p; mode = s; }
+    if (len) out << s << " " << BigUInt(num, len).ToDecimal() << "\n";
+    num += len;
+  }
+
+  BigUInt mean(&ev_[EV_LIMBS * start], EV_LIMBS);
+  int e2 = 195, e3 = 195;
+  ReduceBy2And3(mean, e2, e3);
+  std::cout << "\n=== Exact final-score distribution (start of game) ===" << std::endl;
+  std::cout << "Mean (exact EV): " << DecimalOf(mean, e2, e3, 30) << std::endl;
+  std::cout << "Score range: " << lo << " to " << hi << std::endl;
+  std::cout << "Most likely score: " << mode << " (P = " << std::setprecision(6)
+            << static_cast<double>(mode_p) << ")" << std::endl;
+  for (int t = 0; t < 5; ++t) {
+    std::cout << "P(score >= " << thresholds[t] << ") = " << std::setprecision(10)
+              << static_cast<double>(tail[t]) << std::endl;
+  }
+  std::cout << "Exact distribution written to " << filename << std::endl;
+}
+
+// -------------------------------------------------------------------------
+// MAIN
+// -------------------------------------------------------------------------
+
+int main(int argc, char** argv) {
+  std::cout << "=== Yahtzee Exact PMF Solver ===" << std::endl;
+  std::cout << "Exact distribution of future score under the EV-optimal policy\n"
+            << std::endl;
+
+  // Usage: yahtzee_pmf_solver [--low-memory] [output.bin] [exact_start.txt]
+  bool low_memory = false;
+  std::vector<std::string> files;
+  for (int i = 1; i < argc; ++i) {
+    std::string a = argv[i];
+    if (a == "--low-memory") low_memory = true;
+    else files.push_back(a);
+  }
+  std::string out_file = files.size() > 0 ? files[0] : "yahtzee_pmf_v2.bin";
+  std::string exact_file = files.size() > 1 ? files[1] : "yahtzee_pmf_exact_start.txt";
+
+  auto start = std::chrono::high_resolution_clock::now();
+  ExactPMFSolver solver(low_memory);
+  solver.Solve(out_file);
+  solver.WriteExactStart(exact_file);
+  auto secs = std::chrono::duration_cast<std::chrono::seconds>(
+      std::chrono::high_resolution_clock::now() - start).count();
+  std::cout << "\nTotal time: " << secs << " seconds" << std::endl;
+  return 0;
+}

@@ -2,32 +2,42 @@
 
 ## What It Does
 
-`yahtzee_pmf_solver.cpp` computes, for every reachable Yahtzee board state, the full probability distribution of remaining score under optimal solo play. The output is `yahtzee_pmf_v1.bin`, which is used by the 2-player NN as a near-optimal win-probability feature (P_baseline).
+`yahtzee_pmf_solver.cpp` computes, for every reachable board state, the exact probability distribution of the remaining score under the EV-optimal solo policy. Everything is done in exact rational arithmetic; floats appear only when results are written out.
 
-Formally: for each state `(mask, upper, y_state)`, the PMF gives `P(future_score = s)` for all `s` from 0 to 1575 (the exact theoretical maximum), where score is measured from this state forward, and optimal play is defined by `yahtzee_optimal_v4.bin`.
+Formally: for each reachable state `(mask, upper, y_state)`, the PMF gives `P(future_score = s)` for every `s` from 0 to 1575 (the theoretical maximum), measured from this state forward.
+
+The 2-player NN uses the table as a near-optimal win-probability feature (P_baseline).
 
 ---
 
-## Output File
+## Output Files
 
-| Property | Value |
-|----------|-------|
-| File | `yahtzee_pmf_v1.bin` |
-| Size | 4.7 GB |
-| States | 786,432 (mask × upper × y_state) |
-| Scores per state | 1,576 (0–1575 inclusive) |
-| Format | 16-byte header + raw float32 array |
-| Header | `magic=0x504D4659`, `version=1`, `num_states`, `dense_size` |
+**`yahtzee_pmf_v2.bin`** (1.1 GB), read by `python/yahtzee_2player_env.py` (`load_pmf_table`):
 
-**Verification at starting state (mask=0, upper=0, y_state=0):**
-- PMF expected value: **254.588** (exact match to EV solver)
-- Total probability mass: **1.000000** (exact — no truncation)
+| Part | Contents |
+|------|----------|
+| Header (16 bytes) | `magic=0x504D4659` ("PMFY"), `version=2`, `num_states=786432`, `dense_size=1576` |
+| Index (8 bytes per state) | `uint32 offset`, `int16 lo`, `int16 width`: the state's probabilities for scores `lo .. lo+width-1` are floats `offset .. offset+width-1` of the data section. `width = 0` means the state is unreachable. |
+| Data | float32 probabilities, each the exact value rounded to float |
+
+Only each state's nonzero score range is stored, and unreachable states take no data. The old version 1 layout, with a dense 1576-float row for every state (4.7 GB), is still readable by `load_pmf_table`.
+
+**`yahtzee_pmf_exact_start.txt`**: the exact distribution of a whole game (start state), one `score numerator` line per score, with every probability equal to `numerator / 6^195`.
+
+**Start state summary:**
+
+| | |
+|---|---|
+| Mean | 254.587728734495891231825246064916… (equals the exact EV) |
+| Score range | 12 to 1575 |
+| Most likely score | 266 (P ≈ 0.0125799) |
+| P(score ≥ 200 / 250 / 300 / 400 / 500) | 0.86357 / 0.48369 / 0.14326 / 0.03834 / 0.00719 |
 
 ---
 
 ## Score Ceiling
 
-`DENSE_MAX = 1575` covers every possible game outcome. The maximum occurs when all 13 turns produce a Yahtzee and joker scoring is optimal:
+1575 covers every possible game outcome. The maximum occurs when all 13 turns produce a Yahtzee and joker scoring is optimal:
 
 | Component | Points |
 |-----------|--------|
@@ -38,83 +48,85 @@ Formally: for each state `(mask, upper, y_state)`, the PMF gives `P(future_score
 | 12 × Yahtzee bonus (100 each) | 1,200 |
 | **Total** | **1,575** |
 
-P(all 13 Yahtzees) ≈ (4.6%)^13 ≈ 10⁻²⁴ — astronomically rare, but covering it costs nothing vs. DENSE_MAX = 800.
-
 ---
 
 ## Algorithm
 
-Standard reverse induction. States are processed from `total_filled = 13` down to `0`. For each board state, optimal keep decisions and scoring choices are derived from the preloaded start-of-turn EVs (`board_ev_` from `yahtzee_optimal_v4.bin`; a version 3 file also works, and its mid-turn tables are ignored).
+Standard reverse induction over layers of equal turns remaining: every turn fills exactly one box, so a state's successors are all in the layer solved just before it.
 
-### Per-state computation — three optimizations
+### 1. Exact policy
 
-**1. Keep-decision precomputation (dot products over subsets)**
+With *k* turns left, every EV and every probability is an integer over `D_k = 6^(15k)`: each turn rolls at most 15 dice, each contributing a factor of 1/6, and `max` only selects one of its arguments. The solver keeps integer numerators in fixed-width limbs (`yahtzee_bigint.h`). For each state, `ExactTurnSolver` (`yahtzee_exact_turn.h`) evaluates the turn exactly: the best scoring choice for each final roll, then the best keep with one and with two rolls left, using the keep lattice. It records the policy.
 
-The naive implementation called `GetOptimalScoringMove` inside `GetOptimalKeep(..., rolls_left=1)`, resulting in ~800K scoring evaluations per state. The fix: precompute `term_ev[d] = pts[d] + board_ev[next[d]]` for all 252 terminal outcomes, then compute expected value for every subset as a single dot product:
+Because EVs are exact, near-ties are never misjudged by rounding. Exact ties leave the EV unchanged but can change the distribution, so they are broken by fixed rules:
+- **Scoring:** take the first best option in `ScoringRules` order.
+- **Keeps:** keep more dice, then take the lowest subset id.
 
-```
-subset_ev[k] = Σ_d  trans_probs[k][d] × term_ev[d]      (for keep2)
-roll2_ev[d] = max_{k ∈ valid_subsets(d)} subset_ev[k]
-subset_r2_ev[k] = Σ_d  trans_probs[k][d] × roll2_ev[d]  (for keep1)
-```
+### 2. Final-roll probabilities
 
-Then `keep_for[d] = argmax_{k ∈ valid_subsets(d)} subset_ev[k]`. `roll2_ev` is recomputed per state this way rather than loaded, so the EV file only needs start-of-turn values. Total: 462 × 252 = 116K multiplications vs. ~800K scoring calls. Same pattern as the booty-dice solver's backward EV propagation.
+With the policy fixed, the probability of each final roll is an integer over `6^15 < 2^39`. It is found by pushing integer weights through the keep lattice twice: deposit each outcome's weight on its chosen keep, scaled by `6^|K|`, then add every subset's weight into its six children. Each push takes 1,260 additions.
 
-**2. Three-pass PMF accumulation (matrix products)**
+### 3. Distribution
 
-The original accumulation used a 252³ = 16M iteration triple loop with a 1,576-element inner loop per iteration — O(16M × 1576) ≈ 25 billion operations per state.
-
-Factoring out the three rolls into sequential passes:
+Final rolls leading to the same (points `r`, next board `n`) are merged. Each state has about 35 such pairs on average. Then
 
 ```
-Pass 0:  shifted[r3][s] = board_pmf[next[r3]].dense[s − pts[r3]]
-Pass 1:  pmf2[r2][s]   = Σ_r3  trans[keep2[r2]][r3] × shifted[r3][s]
-Pass 2:  pmf1[r1][s]   = Σ_r2  trans[keep1[r1]][r2] × pmf2[r2][s]
-Pass 3:  result[s]     = Σ_r1  init_probs[r1]        × pmf1[r1][s]
+PMF_k[s] = Σ over pairs (r, n, w) of  w × PMF_{k-1}[n][s − r]
 ```
 
-Each pass is O(252 × ~10_nonzero × 1576) — DAXPY-style, SIMD-vectorizable, cache-friendly. Per-state work: ~4M multiply-adds vs. 25B iterations. Thread-private 404 KB heap buffers per pass avoid stack overflow under OpenMP.
+This is one big-integer multiply-add by a 64-bit weight per (pair, score), with no matrix products and no per-roll passes over distributions.
 
-This is the same factorization the booty-dice solver uses for its within-turn EV propagation (Steps 2–6 in its `compute_turn_value`), applied here to full PMF vectors instead of scalars.
+### 4. Exact checks
 
-**3. OpenMP parallelization**
+For every state, the probabilities must sum to exactly `D_k` (probability 1), and `Σ s × numerator(s)` must equal the exact EV numerator. Any mismatch aborts the run.
 
-States at each fill level are fully independent (the PMF of a state depends only on already-computed deeper states). `#pragma omp parallel` with `schedule(dynamic, 4)` spreads work across all available cores.
+### Memory
+
+Only the previous layer's exact distributions are needed. Each is stored over its score range only, and each probability with only the limbs it needs: one byte per score holds the limb count, followed by the limbs.
+
+- **Default:** both live layers stay in RAM.
+- **`--low-memory`:** each finished layer goes to a temporary file (`<output>.layer0/1`), and the previous layer is read through a read-only memory map. Resident memory then stays around one layer, and the OS can drop those clean pages under pressure.
+
+The float output is written straight to the output file as each state finishes.
 
 ---
 
-## Runtime
+## Performance
 
-Hardware: 15-thread x86-64 Linux, g++ -O3 -march=native -fopenmp
+Measured on 4 cores, `g++ -O3 -march=native -fopenmp`:
 
-| DENSE_MAX | Memory (PMF table) | Runtime | PMF total prob |
-|-----------|-------------------|---------|----------------|
-| 400 (original) | 1.2 GB | ~17 hours (estimated, killed) | 0.962 (truncated) |
-| 400 (with dot-product fix only) | 1.2 GB | ~126s/level-12 → ~17h | 0.962 |
-| 400 (three-pass) | 1.2 GB | 87s | 0.962 |
-| 800 (three-pass) | 2.4 GB | 195s | 0.999997 |
-| **1575 (three-pass, final)** | **4.7 GB** | **536s (~9 min)** | **1.000000** |
+| | Old float solver | Exact solver | Exact, `--low-memory` |
+|---|---|---|---|
+| Wall time | 2,259 s | **~37 s** | ~43 s |
+| Peak RSS | 4.8 GB | 4.0 GB | **2.2 GB** |
+| Output | 4.7 GB (dense rows) | 1.1 GB (v2) | 1.1 GB (v2) |
+| Arithmetic | float32 | exact | exact |
 
-The three-pass restructuring gives a ~700× wall-clock speedup over the naive triple loop. DENSE_MAX = 1575 adds ~2.7× more time than DENSE_MAX = 400 (linear in DENSE_SIZE), which is acceptable since the computation runs once.
+The old solver's time was measured on the same machine, with other runs sharing the CPU for part of it.
 
-Per-level breakdown (DENSE_MAX = 1575):
+Both exact modes produce byte-identical output, and repeated runs are byte-for-byte reproducible. Compared with the old float table, the mean absolute difference per state is 1.3e-5. About 2% of states differ by more than 1e-4, up to 2.7e-3. There the means agree to within float precision (≤ 9e-7 relative), so these are ties or near-ties that the float solver decided differently.
 
-| Categories filled | States | Time (ms) |
-|-------------------|--------|-----------|
-| 13 | 128 | 14 |
-| 12 | 1,600 | 1,965 |
-| 11 | 9,216 | 8,385 |
-| 10 | 32,384 | 25,289 |
-| 9 | 77,440 | 55,688 |
-| 8 | 133,056 | 90,620 |
-| **7 (peak)** | **168,960** | **113,773** |
-| 6 | 160,512 | 105,211 |
-| 5 | 114,048 | 73,812 |
-| 4 | 59,840 | 37,689 |
-| 3 | 22,528 | 13,734 |
-| 2 | 5,760 | 3,577 |
-| 1 | 896 | 589 |
-| 0 | 64 | 60 |
+For comparison, the previous float PMF solver held the dense 4.7 GB table in RAM, and its documented runtime was ~9 minutes on 15 threads. It decided keeps from float EVs, so near-ties could be misjudged, and it computed every state, including unreachable ones.
+
+Per-layer breakdown (default mode):
+
+| Categories filled | States | Time (ms) | Exact layer size |
+|-------------------|--------|-----------|------------------|
+| 12 | 1,598 | 14 | <1 MB |
+| 11 | 9,135 | 102 | 7 MB |
+| 10 | 31,322 | 496 | 61 MB |
+| 9 | 71,237 | 1,342 | 377 MB |
+| 8 | 112,596 | 3,544 | 923 MB |
+| 7 | 126,219 | 6,516 | 1,856 MB |
+| **6 (peak)** | **100,619** | **10,021** | **2,084 MB** |
+| 5 | 56,283 | 5,523 | 1,599 MB |
+| 4 | 21,377 | 2,514 | 827 MB |
+| 3 | 5,178 | 825 | 248 MB |
+| 2 | 711 | 144 | 44 MB |
+| 1 | 44 | 16 | 3 MB |
+| 0 | 1 | 0 | <1 MB |
+
+Profile (thread time): the exact turn solve and the multiply-adds into distributions take roughly equal shares; the rest is packing, float conversion and output writes.
 
 ---
 
@@ -123,12 +135,12 @@ Per-level breakdown (DENSE_MAX = 1575):
 ```python
 from yahtzee_2player_env import load_pmf_table, compute_p_baseline
 
-pmf_dense = load_pmf_table('yahtzee_pmf_v1.bin')
-# pmf_dense.shape = (786432, 1576), dtype float32, memory-mapped
+pmf = load_pmf_table('yahtzee_pmf_v2.bin')
+# pmf.shape == (786432, 1576); pmf[board_index] is a dense float32 row
 
 p_win = compute_p_baseline(mask_cur, upper_cur, y_cur,
                             mask_opp, upper_opp, y_opp,
-                            score_diff, pmf_dense)
+                            score_diff, pmf)
 ```
 
-`compute_p_baseline` computes `Σ_r PMF_cur[r] × CDF_opp[r + diff]` in O(dense_size) time. `dense_size` is read from the file header — no hardcoded constant.
+`compute_p_baseline` computes `Σ_r PMF_cur[r] × CDF_opp[r + diff]` in O(dense_size) time.

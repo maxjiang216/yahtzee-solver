@@ -40,95 +40,6 @@
 #include <cstring>
 #include <chrono>
  
- // Forward declarations
- bool HasNOfAKind(const std::vector<int>& dice, int n);
- 
- // -------------------------------------------------------------------------
- // DICE INDEXER IMPLEMENTATION
- // -------------------------------------------------------------------------
- 
- DiceIndexer::DiceIndexer(int num_dice) {
-   std::vector<int> current;
-   Generate(current, 1, num_dice);
- }
- 
- int DiceIndexer::GetId(std::vector<int> dice) const {
-   std::sort(dice.begin(), dice.end());
-   return dice_to_id.at(dice);
- }
- 
- const std::vector<int>& DiceIndexer::GetDice(int id) const {
-   return id_to_dice[id];
- }
- 
- void DiceIndexer::Generate(std::vector<int>& current, int start_face, int max_depth) {
-   if (static_cast<int>(current.size()) == max_depth) {
-     dice_to_id[current] = id_to_dice.size();
-     id_to_dice.push_back(current);
-     return;
-   }
-   for (int i = start_face; i <= 6; ++i) {
-     current.push_back(i);
-     Generate(current, i, max_depth);
-     current.pop_back();
-   }
- }
- 
- // -------------------------------------------------------------------------
- // SCORING FUNCTIONS (standalone implementations)
- // -------------------------------------------------------------------------
-
-int GetSum(const std::vector<int>& dice) {
-  return std::accumulate(dice.begin(), dice.end(), 0);
-}
-
-bool HasNOfAKind(const std::vector<int>& dice, int n) {
-  int counts[7] = {0};
-  for (int d : dice) counts[d]++;
-  for (int c : counts) if (c >= n) return true;
-  return false;
-}
-
-bool IsFullHouse(const std::vector<int>& dice) {
-  int counts[7] = {0};
-  for (int d : dice) counts[d]++;
-  bool has3 = false, has2 = false;
-  for (int c : counts) {
-    if (c == 5) return true;  // Joker rule
-    if (c == 3) has3 = true;
-    if (c == 2) has2 = true;
-  }
-  return has3 && has2;
-}
-
-bool IsStraight(const std::vector<int>& dice, int len) {
-  int unique[7] = {0};
-  for (int d : dice) unique[d] = 1;
-  int consec = 0;
-  for (int i = 1; i <= 6; ++i) {
-    if (unique[i]) consec++;
-    else consec = 0;
-    if (consec >= len) return true;
-  }
-  return false;
-}
-
-int CalculateScore(int category, const std::vector<int>& dice) {
-  if (category < 6) {
-    return std::count(dice.begin(), dice.end(), category + 1) * (category + 1);
-  }
-  switch (category) {
-    case 6: return HasNOfAKind(dice, 3) ? GetSum(dice) : 0;
-    case 7: return HasNOfAKind(dice, 4) ? GetSum(dice) : 0;
-    case 8: return IsFullHouse(dice) ? 25 : 0;
-    case 9: return IsStraight(dice, 4) ? 30 : 0;
-    case 10: return IsStraight(dice, 5) ? 40 : 0;
-    case 11: return GetSum(dice);
-    case 12: return HasNOfAKind(dice, 5) ? 50 : 0;
-  }
-  return 0;
-}
-
 // -------------------------------------------------------------------------
 // IMPLEMENTATION
 // -------------------------------------------------------------------------
@@ -209,115 +120,25 @@ int CalculateScore(int category, const std::vector<int>& dice) {
  }
  
 float YahtzeeStrategy::GetBoardEV(int mask, int upper, int y_state) const {
-  // Check if all categories are filled (12 non-Yahtzee + Yahtzee filled)
-  int non_yahtzee_mask = mask & ~(1 << 12);  // Strip Yahtzee bit
-  if (non_yahtzee_mask == (1 << 12) - 1 && y_state > 0) return 0.0f;  // All filled
+  if (IsTerminal(mask & FULL_MASK, y_state)) return 0.0f;  // All filled
   return board_ev_[BoardIndex(mask, upper, y_state)];
 }
  
  std::pair<float, int> YahtzeeStrategy::GetBestScoringMove(
      int dice_id, int mask, int upper, int y_state) const {
-   const std::vector<int>& dice = indexer_.GetDice(dice_id);
-   bool is_yahtzee = HasNOfAKind(dice, 5);
-   int yahtzee_num = is_yahtzee ? dice[0] : 0;
-   
+   ScoringOption opts[MAX_SCORING_OPTIONS];
+   int n = rules_.Options(dice_id, mask & FULL_MASK, upper, y_state, opts);
    float max_val = -1.0f;
    int best_cat = -1;
- 
-  // Special case: Yahtzee roll
-  if (is_yahtzee) {
-    if (y_state == 0) {
-      // Yahtzee box open - score 50 points
-      // NOTE: Yahtzee (category 12) is NOT in the 12-bit mask
-      // We only update y_state, not the mask (consistent with solver)
-      float val = 50.0f + GetBoardEV(mask, upper, 2);  // y_state becomes 2
-      if (val > max_val) {
-        max_val = val;
-        best_cat = CAT_YAHTZEE;
-      }
-    } else {
-       // Joker rules
-       float bonus = (y_state == 2) ? 100.0f : 0.0f;
-       int upper_idx = yahtzee_num - 1;
-       bool upper_open = !((mask >> upper_idx) & 1);
- 
-       if (upper_open) {
-         int score = CalculateScore(upper_idx, dice);
-         int next_u = std::min(63, upper + score);
-         float u_bonus = (upper < 63 && next_u >= 63) ? 35.0f : 0.0f;
-         float val = bonus + score + u_bonus + 
-                    GetBoardEV(mask | (1 << upper_idx), next_u, y_state);
-         if (val > max_val) {
-           max_val = val;
-           best_cat = upper_idx;
-         }
-       } else {
-         bool can_play_lower = false;
-         for (int c = 6; c <= 11; ++c) {
-           if (!((mask >> c) & 1)) {
-             can_play_lower = true;
-             int score = CalculateScore(c, dice);
-             if (c == 8) score = 25;
-             else if (c == 9) score = 30;
-             else if (c == 10) score = 40;
-             
-             float val = bonus + score + GetBoardEV(mask | (1 << c), upper, y_state);
-             if (val > max_val) {
-               max_val = val;
-               best_cat = c;
-             }
-           }
-         }
-         
-         if (!can_play_lower) {
-           for (int c = 0; c < 6; ++c) {
-             if (!((mask >> c) & 1)) {
-               float val = bonus + GetBoardEV(mask | (1 << c), upper, y_state);
-               if (val > max_val) {
-                 max_val = val;
-                 best_cat = c;
-               }
-             }
-           }
-         }
-       }
-       return {max_val, best_cat};
+   for (int i = 0; i < n; ++i) {
+     const ScoringOption& o = opts[i];
+     float val = o.reward + GetBoardEV(o.next_mask, o.next_upper, o.next_y_state);
+     if (val > max_val) {
+       max_val = val;
+       best_cat = o.category;
      }
    }
- 
-  // Standard case: try all open categories (0-11 in 12-bit mask, plus Yahtzee separately)
-  for (int c = 0; c < 12; ++c) {  // 0-11, NOT including Yahtzee (12)
-    if (!((mask >> c) & 1)) {
-      int score = CalculateScore(c, dice);
-      int next_u = upper;
-      float u_bonus = 0.0f;
-      
-      if (c < 6) {
-        next_u = std::min(63, upper + score);
-        if (upper < 63 && next_u >= 63) u_bonus = 35.0f;
-      }
-      
-      // Note: c cannot be CAT_YAHTZEE (12) in this loop
-      float val = score + u_bonus + GetBoardEV(mask | (1 << c), next_u, y_state);
-      if (val > max_val) {
-        max_val = val;
-        best_cat = c;
-      }
-    }
-  }
-  
-  // Special case: Yahtzee category when we have a non-Yahtzee roll
-  // For a non-Yahtzee roll, Yahtzee box can only be scored as zero if still open
-  if (y_state == 0 && !HasNOfAKind(dice, 5)) {  // Yahtzee still open and not a Yahtzee roll
-    int score = 0; // Must be zero since not a Yahtzee
-    int next_y = 1; // Mark Yahtzee as closed (used with no Yahtzee scored)
-    float val = GetBoardEV(mask, upper, next_y);
-    if (val > max_val) {
-      max_val = val;
-      best_cat = CAT_YAHTZEE;
-    }
-  }
-   
+   if (n == 0) return {0.0f, -1};  // game over
    return {max_val, best_cat};
  }
  

@@ -27,7 +27,7 @@ from yahtzee_2player_env import (
 from yahtzee_2player_nn import YahtzeeValueNet, YahtzeeInference
 
 EV_FILE  = 'yahtzee_optimal_v4.bin'
-PMF_FILE = 'yahtzee_pmf_v1.bin'
+PMF_FILE = 'yahtzee_pmf_v2.bin'
 
 
 # ---------------------------------------------------------------------------

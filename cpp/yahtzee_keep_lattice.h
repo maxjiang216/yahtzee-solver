@@ -73,6 +73,12 @@ class KeepLattice {
   // Distinct subset ids that can be kept from outcome d
   const std::vector<int>& Keeps(int d) const { return keeps_[d]; }
 
+  // Number of dice in a subset
+  int Size(int sid) const { return static_cast<int>(dice_[sid].size()); }
+
+  // Subset ids of K + {f} for f = 1..6 (only for subsets with < 5 dice)
+  const std::array<int, 6>& Children(int sid) const { return children_[sid]; }
+
   // exp[sid] = expected value of keeping subset sid and rerolling the rest,
   // given values[d] for each five-dice outcome. exp has kNumSubsets entries.
   void Expectations(const float* values, double* exp) const {

@@ -223,19 +223,50 @@ def load_ev_table(filename='yahtzee_optimal_v4.bin'):
     return board_ev
 
 
-def load_pmf_table(filename='yahtzee_pmf_v1.bin'):
+class PMFTable:
     """
-    Load precomputed PMF dense arrays via mmap.
-    Returns (pmf_dense, num_states) where pmf_dense shape=(num_states, DENSE_SIZE).
+    Read-only view of the PMF table: pmf[board_index] is a dense float32 row
+    of P(future score = s) for s = 0 .. dense_size-1, and pmf.shape is
+    (num_states, dense_size), like a 2-D array.
+
+    Version 2 files (yahtzee_pmf_v2.bin) store each state's nonzero score
+    range only: an index of {uint32 offset, int16 lo, int16 width} entries,
+    then the float data. Version 1 files store full dense rows.
+    """
+
+    def __init__(self, filename):
+        with open(filename, 'rb') as f:
+            magic, version, num_states, dense_size = struct.unpack('<IIII', f.read(16))
+        if magic != 0x504D4659 or version not in (1, 2):
+            raise ValueError(f'Invalid PMF file: magic={hex(magic)} version={version}')
+        self.version = version
+        self.shape = (num_states, dense_size)
+        if version == 1:
+            self._dense = np.memmap(filename, dtype='float32', mode='r',
+                                    offset=16, shape=self.shape)
+        else:
+            index_dtype = np.dtype([('offset', '<u4'), ('lo', '<i2'), ('width', '<i2')])
+            self._index = np.memmap(filename, dtype=index_dtype, mode='r',
+                                    offset=16, shape=(num_states,))
+            self._data = np.memmap(filename, dtype='float32', mode='r',
+                                   offset=16 + index_dtype.itemsize * num_states)
+
+    def __getitem__(self, idx):
+        if self.version == 1:
+            return self._dense[idx]
+        offset, lo, width = self._index[idx]
+        row = np.zeros(self.shape[1], dtype=np.float32)
+        row[lo:lo + width] = self._data[offset:offset + width]
+        return row
+
+
+def load_pmf_table(filename='yahtzee_pmf_v2.bin'):
+    """
+    Load the precomputed PMF table (memory-mapped).
+    Returns a PMFTable: pmf[board_index] -> dense row of length dense_size.
     dense_size is read from the file header — no hardcoded constant needed.
     """
-    with open(filename, 'rb') as f:
-        magic, version, num_states, dense_size = struct.unpack('<IIII', f.read(16))
-    if magic != 0x504D4659 or version != 1:
-        raise ValueError(f'Invalid PMF file: magic={hex(magic)} version={version}')
-    pmf_dense = np.memmap(filename, dtype='float32', mode='r',
-                          offset=16, shape=(num_states, dense_size))
-    return pmf_dense
+    return PMFTable(filename)
 
 # ---------------------------------------------------------------------------
 # P_baseline: win probability under both-play-solo-optimally

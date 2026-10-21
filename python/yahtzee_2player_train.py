@@ -41,7 +41,7 @@ from yahtzee_2player_nn import YahtzeeValueNet, YahtzeeInference, EMANet
 # ---------------------------------------------------------------------------
 
 EV_FILE  = 'yahtzee_optimal_v4.bin'
-PMF_FILE = 'yahtzee_pmf_v1.bin'
+PMF_FILE = 'yahtzee_pmf_v2.bin'
 CKPT_DIR = Path('checkpoints_2player')
 
 # ---------------------------------------------------------------------------

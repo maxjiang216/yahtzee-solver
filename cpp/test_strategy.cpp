@@ -14,6 +14,9 @@
 #include <vector>
 #include <cassert>
 
+// Failed checks across all tests (non-zero exit if any)
+static int g_failures = 0;
+
 void TestYahtzeeScoring() {
   std::cout << "\n=== Test 1: Yahtzee Scoring (50 vs 0) ===" << std::endl;
   
@@ -66,6 +69,7 @@ void TestYahtzeeScoring() {
     }
   }
   
+  g_failures += failures;
   std::cout << "\nTest 1 Results: " << (tests - failures) << "/" << tests 
             << " passed" << std::endl;
   if (failures > 0) {
@@ -121,6 +125,7 @@ void TestUpperScoreMonotonicity() {
     }
   }
   
+  g_failures += failures;
   std::cout << "\nTest 2 Results: " << (tests - failures) << "/" << tests 
             << " passed" << std::endl;
   if (failures > 0) {
@@ -181,6 +186,7 @@ void TestYahtzeeOpenVsScoredZero() {
     }
   }
   
+  g_failures += failures;
   std::cout << "\nTest 3 Results: " << (tests - failures) << "/" << tests 
             << " passed" << std::endl;
   if (failures > 0) {
@@ -231,8 +237,8 @@ int main() {
     TestYahtzeeOpenVsScoredZero();
     TestSpecificCases();
     
-    std::cout << "\n=== All Tests Complete ===" << std::endl;
-    return 0;
+    std::cout << "\n=== All Tests Complete: " << g_failures << " failures ===" << std::endl;
+    return g_failures ? 1 : 0;
   } catch (const std::exception& e) {
     std::cerr << "Error: " << e.what() << std::endl;
     return 1;
