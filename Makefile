@@ -32,6 +32,8 @@ TEST_BIN = test_strategy
 STRATEGY_FILE = yahtzee_optimal_v3.bin
 PMF_FILE = yahtzee_pmf_v1.bin
 PMF_BIN = yahtzee_pmf_solver
+RATIONAL_BIN = yahtzee_rational_solver
+RATIONAL_FILE = yahtzee_rational_v1.bin
 
 # Default target
 .PHONY: all
@@ -55,6 +57,19 @@ pmf-solve: $(PMF_BIN)
 	@echo "Running PMF solver (this may take 5-30 minutes)..."
 	./$(PMF_BIN) $(STRATEGY_FILE)
 	@echo "PMF file generated: $(PMF_FILE)"
+
+# Build exact rational EV solver
+.PHONY: rational
+rational: $(RATIONAL_BIN)
+
+$(RATIONAL_BIN): cpp/yahtzee_rational_solver.cpp
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $<
+	@echo "Rational solver built. Run 'make rational-solve' to generate $(RATIONAL_FILE)"
+
+# Run exact rational EV solver (~5 s on 4 cores)
+.PHONY: rational-solve
+rational-solve: $(RATIONAL_BIN)
+	./$(RATIONAL_BIN) $(RATIONAL_FILE)
 
 # Build solver
 .PHONY: solver
@@ -135,7 +150,7 @@ test-unit: $(TEST_BIN)
 # Clean build artifacts
 .PHONY: clean
 clean:
-	rm -f $(SOLVER_BIN) $(DEMO_BIN) $(GUIDE_BIN) $(TEST_BIN)
+	rm -f $(SOLVER_BIN) $(DEMO_BIN) $(GUIDE_BIN) $(TEST_BIN) $(RATIONAL_BIN)
 	rm -f $(SOLVER_OBJ) $(STRATEGY_OBJ)
 	@echo "Cleaned build artifacts"
 
@@ -154,6 +169,8 @@ help:
 	@echo "  make solver    - Build the solver executable"
 	@echo "  make demo      - Build the strategy query demo"
 	@echo "  make guide     - Build the interactive guide"
+	@echo "  make rational  - Build the exact rational EV solver"
+	@echo "  make rational-solve - Compute the exact EV table (~5 s)"
 	@echo "  make all       - Build solver and demo"
 	@echo "  make solve     - Run solver to generate strategy file (~5-30 min)"
 	@echo "  make test      - Run demo to test the strategy"

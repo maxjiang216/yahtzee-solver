@@ -9,6 +9,8 @@ Optimal solo Yahtzee solver in C++ with a 2-player neural network extension.
 - `yahtzee_optimal_v3.bin` (1.5 GB) — expected value and optimal keep/score decisions for every board state
 - `yahtzee_pmf_v1.bin` (4.7 GB) — full probability distribution over remaining scores for every board state
 
+**Exact rational solver (C++):** Recomputes every board-state EV with exact rational arithmetic (no floating point) in ~5 seconds, producing `yahtzee_rational_v1.bin` (54 MB) and the exact optimal EV as a reduced fraction.
+
 **2-player solver (Python + PyTorch):** Neural network that estimates P(current player wins | both play optimally) for any pair of board states and accumulated score difference. Trained via supervised bootstrap on the PMF table, then refined with TD self-play RL.
 
 ## Project Structure
@@ -18,6 +20,7 @@ cpp/
   yahtzee_strategy.{h,cpp}         shared board state, scoring, dice transitions
   yahtzee_optimized_solver.cpp     solo EV solver → yahtzee_optimal_v3.bin
   yahtzee_pmf_solver.cpp           PMF table solver → yahtzee_pmf_v1.bin
+  yahtzee_rational_solver.cpp      exact rational EV solver → yahtzee_rational_v1.bin
   yahtzee_guide_v3.cpp             interactive solo guide
   test_{strategy,probabilities}.cpp
 
@@ -59,6 +62,13 @@ make pmf && make pmf-solve
 # Produces yahtzee_pmf_v1.bin (~4.7 GB, takes ~9 min on 15 cores)
 ```
 
+### 2b. Exact rational EV (optional)
+
+```bash
+make rational && make rational-solve
+# Prints the exact optimal EV as a fraction; writes yahtzee_rational_v1.bin (54 MB, ~5 s)
+```
+
 ### 3. Interactive solo guide
 
 ```bash
@@ -81,12 +91,21 @@ python python/yahtzee_2player_train.py --phase 3 --load checkpoints_2player/phas
 | Metric | Value |
 |--------|-------|
 | Solo EV at start | **254.588** |
+| Exact solo EV | **254.58772873449589…** = N / (2^169 · 3^181), N has 140 digits |
 | PMF total probability mass | **1.000000** (exact, no truncation) |
 | PMF score range | 0–1575 (covers all 13-Yahtzee games) |
 | PMF solver runtime | ~9 min on 15 cores |
 | PMF solver speedup | ~700× vs naive triple-loop |
 
 The PMF solver uses a three-pass matrix factorization that factors the 252³ nested loop into three sequential DAXPY passes — see [docs/PMF_SOLVER_NOTES.md](docs/PMF_SOLVER_NOTES.md) for details.
+
+## Exact Rational Solver
+
+Every probability in a turn is a product of 1/6 factors, and `max` only selects one of its arguments, so with *k* turns left every board EV is an integer over the fixed denominator 6^(15k). The solver therefore works on integer numerators only: big-integer addition, multiplication by small constants, and integer comparison. It needs no gcd, no cross-multiplied fraction comparisons and no heap allocation. Numerators fit in at most 9 × 64-bit limbs (< 2^517), and each layer is compiled with the smallest limb count it needs.
+
+The reroll stages use the keep lattice: `E[K] = (1/6) Σ_f E[K ∪ {f}]` over the 462 kept multisets. That is 1,260 big-int additions per stage instead of a 462×252 matrix product. Only reachable upper scores are solved (536,320 board states).
+
+Every reachable board state agrees with the float solver to ≤ 4e-6 relative error.
 
 ## 2-Player Solver Design
 

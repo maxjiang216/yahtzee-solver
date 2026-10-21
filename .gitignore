@@ -6,6 +6,7 @@ yahtzee_solver
 yahtzee_guide
 yahtzee_guide_test
 yahtzee_pmf_solver
+yahtzee_rational_solver
 strategy_demo
 test_probabilities
 
