@@ -6,7 +6,7 @@ Optimal solo Yahtzee solver in C++ with a 2-player neural network extension.
 
 **Solo solver (C++):** Computes the exact optimal strategy via reverse-induction dynamic programming over ~536K reachable board states. Produces two precomputed tables:
 
-- `yahtzee_optimal_v3.bin` (1.5 GB) — expected value and optimal keep/score decisions for every board state
+- `yahtzee_optimal_v4.bin` (3 MB) — expected value at the start of every turn. Every mid-turn decision (which dice to keep, where to score) is recomputed from it on demand in well under a millisecond, so nothing else is stored.
 - `yahtzee_pmf_v1.bin` (4.7 GB) — full probability distribution over remaining scores for every board state
 
 **Exact rational solver (C++):** Recomputes every board-state EV with exact rational arithmetic (no floating point) in ~5 seconds, producing `yahtzee_rational_v1.bin` (54 MB) and the exact optimal EV as a reduced fraction.
@@ -17,8 +17,9 @@ Optimal solo Yahtzee solver in C++ with a 2-player neural network extension.
 
 ```
 cpp/
-  yahtzee_strategy.{h,cpp}         shared board state, scoring, dice transitions
-  yahtzee_optimized_solver.cpp     solo EV solver → yahtzee_optimal_v3.bin
+  yahtzee_strategy.{h,cpp}         strategy queries (keep / category) from board EVs
+  yahtzee_keep_lattice.h           shared within-turn keep expectations
+  yahtzee_optimized_solver.cpp     solo EV solver → yahtzee_optimal_v4.bin
   yahtzee_pmf_solver.cpp           PMF table solver → yahtzee_pmf_v1.bin
   yahtzee_rational_solver.cpp      exact rational EV solver → yahtzee_rational_v1.bin
   yahtzee_guide_v3.cpp             interactive solo guide
@@ -52,7 +53,7 @@ pip install -r requirements.txt
 
 ```bash
 make solver && make solve
-# Produces yahtzee_optimal_v3.bin (~1.5 GB file, ~9 s, ~11 MB of RAM)
+# Produces yahtzee_optimal_v4.bin (3 MB, ~4 s)
 ```
 
 ### 2. Generate the PMF table
@@ -73,7 +74,7 @@ make rational && make rational-solve
 
 ```bash
 make guide
-./yahtzee_guide yahtzee_optimal_v3.bin
+./yahtzee_guide yahtzee_optimal_v4.bin
 ```
 
 ### 4. Train the 2-player NN

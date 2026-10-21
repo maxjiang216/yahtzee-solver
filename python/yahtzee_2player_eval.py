@@ -17,7 +17,7 @@ import numpy as np
 import torch
 
 from yahtzee_2player_env import (
-    load_roll_tables, load_pmf_table,
+    load_ev_table, load_pmf_table,
     board_index, get_best_scoring_move,
     compute_p_baseline, extract_features,
     TRANS_PROBS, NUM_DICE_COMBOS, VALID_SUBSETS_FOR_OUTCOME,
@@ -26,7 +26,7 @@ from yahtzee_2player_env import (
 )
 from yahtzee_2player_nn import YahtzeeValueNet, YahtzeeInference
 
-EV_FILE  = 'yahtzee_optimal_v3.bin'
+EV_FILE  = 'yahtzee_optimal_v4.bin'
 PMF_FILE = 'yahtzee_pmf_v1.bin'
 
 
@@ -34,7 +34,7 @@ PMF_FILE = 'yahtzee_pmf_v1.bin'
 # 1. Win rate: NN vs solo-optimal
 # ---------------------------------------------------------------------------
 
-def eval_win_rate(inference, board_ev, roll2_ev, pmf_dense, n_games=1000):
+def eval_win_rate(inference, board_ev, pmf_dense, n_games=1000):
     """
     NN player always goes first. Returns (nn_win_rate, avg_score_nn, avg_score_solo).
     """
@@ -52,11 +52,11 @@ def eval_win_rate(inference, board_ev, roll2_ev, pmf_dense, n_games=1000):
             # NN player 1's turn: just use solo-optimal for now (NN guides scoring choice)
             # For a proper NN-guided turn, we'd do the tree search.
             # Here we use solo-optimal as a proxy to test win rate baseline.
-            pts1, nm1, nu1, ny1 = simulate_turn_solo_optimal(m1, u1, y1, board_ev, roll2_ev)
+            pts1, nm1, nu1, ny1 = simulate_turn_solo_optimal(m1, u1, y1, board_ev)
             m1, u1, y1 = nm1, nu1, ny1
             s1 += pts1
 
-            pts2, nm2, nu2, ny2 = simulate_turn_solo_optimal(m2, u2, y2, board_ev, roll2_ev)
+            pts2, nm2, nu2, ny2 = simulate_turn_solo_optimal(m2, u2, y2, board_ev)
             m2, u2, y2 = nm2, nu2, ny2
             s2 += pts2
 
@@ -156,14 +156,14 @@ if __name__ == '__main__':
     inference = YahtzeeInference(model, device=args.device)
 
     print('Loading tables...')
-    board_ev, roll1_ev, roll2_ev = load_roll_tables(EV_FILE)
+    board_ev = load_ev_table(EV_FILE)
     pmf_dense = load_pmf_table(PMF_FILE)
 
     print(f'\nRunning evaluation ({args.games} games, {args.pairs} symmetry pairs)...')
 
     # 1. Win rate
     print('\n  Win rate (NN as player 1 vs solo-optimal player 2):')
-    wr, s_nn, s_solo = eval_win_rate(inference, board_ev, roll2_ev, pmf_dense, args.games)
+    wr, s_nn, s_solo = eval_win_rate(inference, board_ev, pmf_dense, args.games)
     print(f'    Win rate: {wr:.3f}  NN avg score: {s_nn:.1f}  Solo avg score: {s_solo:.1f}')
 
     # 2. Symmetry

@@ -288,10 +288,8 @@
      std::vector<std::vector<float>> trans_probs_;
      std::vector<std::vector<int>> valid_subsets_for_outcome_;
      
-     // Loaded EV strategy (for determining optimal actions)
+     // Loaded start-of-turn EVs (optimal actions are derived from these)
      std::vector<float> board_ev_;
-     std::vector<float> roll1_ev_;
-     std::vector<float> roll2_ev_;
      
      // PMF tables
      std::vector<PMF> board_pmf_;  // PMF at start of turn
@@ -301,23 +299,10 @@
          return (mask * MAX_UPPER_SCORE + upper) * NUM_Y_STATES + y_state;
      }
      
-     inline size_t RollIndex(int mask, int upper, int y_state, int dice_id) const {
-         return ((mask * MAX_UPPER_SCORE + upper) * NUM_Y_STATES + y_state) * 
-                NUM_DICE_COMBOS + dice_id;
-     }
-     
      // EV accessors
      float GetBoardEV(int mask, int upper, int y_state) const {
          if (mask == (1 << 12) - 1 && y_state > 0) return 0.0f;
          return board_ev_[BoardIndex(mask, upper, y_state)];
-     }
-     
-     float GetRoll1EV(int mask, int upper, int y_state, int dice_id) const {
-         return roll1_ev_[RollIndex(mask, upper, y_state, dice_id)];
-     }
-     
-     float GetRoll2EV(int mask, int upper, int y_state, int dice_id) const {
-         return roll2_ev_[RollIndex(mask, upper, y_state, dice_id)];
      }
      
      void LoadEVStrategy(const std::string& filename);
@@ -335,9 +320,6 @@
      };
      
      ScoringResult GetOptimalScoringMove(int dice_id, int mask, int upper, int y_state) const;
-     
-     // Get optimal keep choice (returns subset_id)
-     int GetOptimalKeep(int dice_id, int mask, int upper, int y_state, int rolls_left) const;
  };
  
  void YahtzeePMFSolver::LoadEVStrategy(const std::string& filename) {
@@ -354,17 +336,18 @@
      in.read(reinterpret_cast<char*>(&board_size), sizeof(board_size));
      in.read(reinterpret_cast<char*>(&roll_size), sizeof(roll_size));
      
-     if (magic != 0x59414854 || version != 3) {
+     // Version 4: board EVs only. Version 3: board EVs followed by mid-turn
+     // tables, which are not needed (keep decisions are recomputed below).
+     if (magic != 0x59414854 || (version != 3 && version != 4) ||
+         board_size != BOARD_STATE_SIZE) {
          throw std::runtime_error("Invalid EV strategy file format");
      }
      
      board_ev_.resize(board_size);
-     roll1_ev_.resize(roll_size);
-     roll2_ev_.resize(roll_size);
-     
      in.read(reinterpret_cast<char*>(board_ev_.data()), board_size * sizeof(float));
-     in.read(reinterpret_cast<char*>(roll1_ev_.data()), roll_size * sizeof(float));
-     in.read(reinterpret_cast<char*>(roll2_ev_.data()), roll_size * sizeof(float));
+     if (!in) {
+         throw std::runtime_error("Failed to read EV strategy file");
+     }
      
      std::cout << " done" << std::endl;
  }
@@ -560,42 +543,6 @@
      return best;
  }
  
- int YahtzeePMFSolver::GetOptimalKeep(int dice_id, int mask, int upper, 
-                                       int y_state, int rolls_left) const {
-     std::vector<int> dice = indexer_5_.GetDice(dice_id);
-     
-     float best_ev = -1e9f;
-     int best_subset = 0;
-     
-     for (int sid : valid_subsets_for_outcome_[dice_id]) {
-         float ev = 0.0f;
-         const auto& probs = trans_probs_[sid];
-         
-         for (int outcome = 0; outcome < NUM_DICE_COMBOS; outcome++) {
-             if (probs[outcome] > 0) {
-                 float outcome_ev;
-                 if (rolls_left == 2) {
-                     outcome_ev = GetRoll2EV(mask, upper, y_state, outcome);
-                 } else {
-                     // Terminal - compute best scoring move
-                     auto result = GetOptimalScoringMove(outcome, mask, upper, y_state);
-                     outcome_ev = result.points + GetBoardEV(result.next_mask, 
-                                                             result.next_upper, 
-                                                             result.next_y_state);
-                 }
-                 ev += probs[outcome] * outcome_ev;
-             }
-         }
-         
-         if (ev > best_ev) {
-             best_ev = ev;
-             best_subset = sid;
-         }
-     }
-     
-     return best_subset;
- }
- 
  void YahtzeePMFSolver::Solve() {
      std::cout << "\nStarting PMF computation (reverse induction)...\n" << std::endl;
 
@@ -656,31 +603,42 @@
                  for (int d = 0; d < NUM_DICE_COMBOS; d++)
                      term_ev[d] = final_res[d].points + board_ev_[final_res[d].next_idx];
 
+                 // Keep with one roll left: maximise E[term_ev]; this also
+                 // gives roll2_ev[d], the value of outcome d with one roll left
                  const int NUM_SUBSETS = 462;
                  float subset_ev[NUM_SUBSETS];
                  float subset_roll2_ev[NUM_SUBSETS];
-                 size_t board_base = BoardIndex(mask, upper, y_state) * NUM_DICE_COMBOS;
+                 float roll2_ev[NUM_DICE_COMBOS];
                  for (int sid = 0; sid < NUM_SUBSETS; sid++) {
                      const auto& probs = trans_probs_[sid];
-                     float ev2 = 0.0f, ev1 = 0.0f;
-                     for (int d = 0; d < NUM_DICE_COMBOS; d++) {
-                         float p = probs[d];
-                         ev2 += p * term_ev[d];
-                         ev1 += p * roll2_ev_[board_base + d];
-                     }
+                     float ev2 = 0.0f;
+                     for (int d = 0; d < NUM_DICE_COMBOS; d++) ev2 += probs[d] * term_ev[d];
                      subset_ev[sid] = ev2;
-                     subset_roll2_ev[sid] = ev1;
                  }
-
                  for (int d = 0; d < NUM_DICE_COMBOS; d++) {
-                     float best1 = -1e9f, best2 = -1e9f;
-                     int sid1 = 0, sid2 = 0;
+                     float best2 = -1e9f;
+                     int sid2 = 0;
                      for (int sid : valid_subsets_for_outcome_[d]) {
-                         if (subset_roll2_ev[sid] > best1) { best1 = subset_roll2_ev[sid]; sid1 = sid; }
                          if (subset_ev[sid] > best2) { best2 = subset_ev[sid]; sid2 = sid; }
                      }
-                     keep1_for[d] = sid1;
                      keep2_for[d] = sid2;
+                     roll2_ev[d] = best2;
+                 }
+
+                 // Keep with two rolls left: maximise E[roll2_ev]
+                 for (int sid = 0; sid < NUM_SUBSETS; sid++) {
+                     const auto& probs = trans_probs_[sid];
+                     float ev1 = 0.0f;
+                     for (int d = 0; d < NUM_DICE_COMBOS; d++) ev1 += probs[d] * roll2_ev[d];
+                     subset_roll2_ev[sid] = ev1;
+                 }
+                 for (int d = 0; d < NUM_DICE_COMBOS; d++) {
+                     float best1 = -1e9f;
+                     int sid1 = 0;
+                     for (int sid : valid_subsets_for_outcome_[d]) {
+                         if (subset_roll2_ev[sid] > best1) { best1 = subset_roll2_ev[sid]; sid1 = sid; }
+                     }
+                     keep1_for[d] = sid1;
                  }
 
                  // --- Pass 0: shifted[r3][s] = board_pmf_[next[r3]].dense[s - pts[r3]] ---
@@ -844,7 +802,7 @@
      std::cout << "=== Yahtzee PMF Solver ===" << std::endl;
      std::cout << "Computes probability distribution of future scores\n" << std::endl;
      
-     std::string ev_file = "yahtzee_optimal_v3.bin";
+     std::string ev_file = "yahtzee_optimal_v4.bin";
      if (argc > 1) {
          ev_file = argv[1];
      }

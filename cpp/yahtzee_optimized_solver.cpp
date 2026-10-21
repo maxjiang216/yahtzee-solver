@@ -1,32 +1,23 @@
 /**
- * Yahtzee Optimal Strategy Solver - Optimized Memory Version
+ * Yahtzee Optimal Strategy Solver
  * 
  * This program uses dynamic programming with reverse induction to compute the
- * optimal strategy for Yahtzee. The solver precomputes and stores mid-turn
- * expected values for fast runtime queries.
+ * optimal strategy for Yahtzee. It stores only the expected value at the
+ * start of each turn; every mid-turn decision (which dice to keep, where to
+ * score) follows from those values in microseconds, so readers recompute
+ * them on demand with KeepLattice (yahtzee_keep_lattice.h).
  * 
- * MEMORY OPTIMIZATION:
- * ===================
- * - Direct array indexing (no hash maps)
- * - Float precision (4 bytes vs 8 bytes)
- * - Packed state representation
- *
  * SPEED:
  * ======
  * - Rerolls use the keep lattice E[K] = (1/6) * sum_f E[K + {f}] (accumulated
  *   in double) instead of a 462x252 transition matrix
  * - Scores are looked up from a precomputed 252x13 table
- * - Only reachable upper totals are solved; unreachable entries stay 0
  *
- * Output file: ~1.59 GB
- *   - Board EVs (start of turn): 3.1 MB
- *   - Roll1 EVs (2 rolls left): 793 MB
- *   - Roll2 EVs (1 roll left): 793 MB
- *
- * Only the board EVs are kept in memory. The DP never reads roll EVs back,
- * so each state's 252-entry roll rows are streamed straight into the output
- * file with pwrite(). The file is pre-sized with ftruncate(), so unreachable
- * rows are never written: they are holes that read back as zeros.
+ * OUTPUT (yahtzee_optimal_v4.bin, ~3 MB):
+ * =======================================
+ * 16-byte header {magic "YAHT", version 4, board_size, roll_size = 0}
+ * followed by board_size floats. (Version 3 files additionally carried two
+ * 198M-entry mid-turn tables; readers still accept them and ignore those.)
  * 
  * STATE REPRESENTATION:
  * ====================
@@ -35,13 +26,9 @@
  * - upper: Upper section score (0-63, capped at 63 for bonus)
  * - y_state: Yahtzee state (0=open, 1=filled with 0, 2=filled with 50)
  * 
- * Mid-turn state adds:
- * - dice_id: Dice combination ID (0-251)
- * 
  * INDEXING:
  * =========
  * board_index = (mask * 64 + upper) * 3 + y_state
- * roll_index = ((mask * 64 + upper) * 3 + y_state) * 252 + dice_id
  */
 
  #include <iostream>
@@ -60,11 +47,9 @@
  #include <cstring>
  #include <array>
  #include <cstdint>
- #include <cerrno>
- #include <cstdio>
  #include <cstdlib>
- #include <fcntl.h>
- #include <unistd.h>
+
+ #include "yahtzee_keep_lattice.h"
  
  // -------------------------------------------------------------------------
  // CONSTANTS
@@ -88,7 +73,6 @@
  
  // State space sizes
  const int BOARD_STATE_SIZE = NUM_BOARD_MASKS * MAX_UPPER_SCORE * NUM_Y_STATES;
- const int ROLL_STATE_SIZE = BOARD_STATE_SIZE * NUM_DICE_COMBOS;
  
  // -------------------------------------------------------------------------
  // DICE & INDEXING HELPERS
@@ -212,65 +196,39 @@
  /**
   * YahtzeeSolver: Computes optimal strategy using dynamic programming
   * 
-  * Produces three tables:
-  * 1. board_ev: Expected value at start of turn (786K states, in memory)
-  * 2. roll1_ev: Expected value with 2 rolls left (198M states, streamed to file)
-  * 3. roll2_ev: Expected value with 1 roll left (198M states, streamed to file)
-  * 
-  * All tables use float (4 bytes) for 50% memory savings vs double.
+  * Stores only board_ev: the expected value at the start of each turn
+  * (786K states, 3 MB as float). Mid-turn values (keep and scoring decisions)
+  * follow from board_ev with a few lattice passes, so readers recompute them
+  * on demand (see yahtzee_keep_lattice.h).
   */
  class YahtzeeSolver {
   public:
    YahtzeeSolver() : indexer_5_(5) {
-     InitDiceSubsets();
-     BuildKeepLattice();
      BuildScoreTables();
-     AllocateTables();
+     board_ev_.assign(BOARD_STATE_SIZE, 0.0f);
    }
  
-   // Main solver - compute all EVs and write them to filename
-   void Solve(const std::string& filename);
+   // Main solver - compute all EVs
+   void Solve();
+
+   // Save board EVs to binary file (format version 4)
+   void SaveToFile(const std::string& filename) const;
  
   private:
    // Dice indexing
    DiceIndexer indexer_5_;
-   std::vector<std::vector<int>> all_subsets_dice_;  // All 462 subsets (0-5 dice)
-   std::map<std::vector<int>, int> subset_to_id_;
- 
-   // Keep lattice: subset ids are ordered by size, so the 252 five-dice
-   // subsets occupy ids [kFirst5, 462) in indexer_5_ order.
-   // children_[id][f-1] = id of subset + {f}, for subsets with < 5 dice.
-   static const int kFirst5 = 462 - NUM_DICE_COMBOS;
-   std::vector<std::array<int, 6>> children_;
+   KeepLattice lattice_;
 
    // Precomputed per-outcome scores and Yahtzee face (0 if not a Yahtzee)
    std::vector<std::array<int, NUM_CATS>> score_;
    std::vector<int> yahtzee_face_;
-
-   // reachable_[upper_mask6] bit u set if upper total u (capped) is reachable
-   std::array<uint64_t, 64> reachable_;
-   
-   // Optimization: valid_subsets_for_outcome[outcome_id] = list of subset_ids
-   std::vector<std::vector<int>> valid_subsets_for_outcome_;
  
-   // Board EV table (roll tables go straight to the output file)
+   // Board EV table
    std::vector<float> board_ev_;   // 786K entries × 4 bytes = 3.1 MB
-
-   // Output file layout: 16-byte header, board, roll1, roll2
-   static const size_t kHeaderBytes = 16;
-   static const size_t kRoll1Offset = kHeaderBytes + sizeof(float) * BOARD_STATE_SIZE;
-   static const size_t kRoll2Offset = kRoll1Offset + sizeof(float) * ROLL_STATE_SIZE;
-   static const size_t kFileBytes = kRoll2Offset + sizeof(float) * ROLL_STATE_SIZE;
-   int out_fd_ = -1;
  
    // Indexing functions
    inline size_t BoardIndex(int mask, int upper, int y_state) const {
      return (mask * MAX_UPPER_SCORE + upper) * NUM_Y_STATES + y_state;
-   }
- 
-   inline size_t RollIndex(int mask, int upper, int y_state, int dice_id) const {
-     return ((mask * MAX_UPPER_SCORE + upper) * NUM_Y_STATES + y_state) * 
-            NUM_DICE_COMBOS + dice_id;
    }
  
    // EV accessors
@@ -291,142 +249,25 @@
      board_ev_[BoardIndex(mask, upper, y_state)] = val;
    }
  
-   // Write bytes at an absolute file offset (thread-safe; exits on error)
-   void WriteAt(size_t offset, const void* data, size_t bytes) const;
-
-   // Write one state's 252 roll EVs to the table starting at table_offset
-   inline void WriteRollRow(size_t table_offset, int mask, int upper, int y_state,
-                            const float* values) const {
-     WriteAt(table_offset + sizeof(float) * RollIndex(mask, upper, y_state, 0),
-             values, sizeof(float) * NUM_DICE_COMBOS);
-   }
- 
    // Helper functions
-   void InitDiceSubsets();
-   void BuildKeepLattice();
    void BuildScoreTables();
-   void AllocateTables();
-
-   // One reroll decision: E[K] = (1/6) * sum_f E[K + {f}] down the lattice,
-   // then out[d] = best keep of outcome d. exp is scratch of size 462.
-   void RerollStage(const float* in, float* out, double* exp) const;
    
    // Get best scoring move for a dice outcome
    std::pair<float, int> GetBestScoringMove(int dice_id, int mask, int upper, 
                                             int y_state) const;
  };
- 
- void YahtzeeSolver::InitDiceSubsets() {
-   for (int i = 0; i <= 5; i++) {
-     DiceIndexer tmp(i);
-     for (const auto& d : tmp.id_to_dice) {
-       subset_to_id_[d] = all_subsets_dice_.size();
-       all_subsets_dice_.push_back(d);
-     }
-   }
-   std::cout << "Initialized " << all_subsets_dice_.size() 
-             << " dice subsets (0-5 dice)" << std::endl;
- }
- 
- void YahtzeeSolver::BuildKeepLattice() {
-   std::cout << "Building keep lattice..." << std::endl;
-
-   children_.resize(kFirst5);
-   for (int i = 0; i < kFirst5; i++) {
-     for (int f = 1; f <= 6; f++) {
-       std::vector<int> c = all_subsets_dice_[i];
-       c.push_back(f);
-       std::sort(c.begin(), c.end());
-       children_[i][f - 1] = subset_to_id_.at(c);
-     }
-   }
-   for (int d = 0; d < NUM_DICE_COMBOS; d++) {
-     assert(subset_to_id_.at(indexer_5_.GetDice(d)) == kFirst5 + d);
-   }
-
-   // Precompute valid subsets for each outcome
-   valid_subsets_for_outcome_.resize(NUM_DICE_COMBOS);
-   for (int d = 0; d < NUM_DICE_COMBOS; d++) {
-     std::vector<int> dice = indexer_5_.GetDice(d);
-     // Check all 32 possible keep masks
-     for (int m = 0; m < 32; m++) {
-       std::vector<int> sub;
-       for (int b = 0; b < 5; b++) {
-         if ((m >> b) & 1) sub.push_back(dice[b]);
-       }
-       std::sort(sub.begin(), sub.end());
-       valid_subsets_for_outcome_[d].push_back(subset_to_id_[sub]);
-     }
-     // Remove duplicates
-     std::sort(valid_subsets_for_outcome_[d].begin(), 
-               valid_subsets_for_outcome_[d].end());
-     auto last = std::unique(valid_subsets_for_outcome_[d].begin(), 
-                            valid_subsets_for_outcome_[d].end());
-     valid_subsets_for_outcome_[d].erase(last, 
-                                         valid_subsets_for_outcome_[d].end());
-   }
-   
-   std::cout << "Keep lattice built successfully" << std::endl;
- }
 
  void YahtzeeSolver::BuildScoreTables() {
+   for (int d = 0; d < NUM_DICE_COMBOS; d++) {
+     assert(lattice_.SubsetId(indexer_5_.GetDice(d)) == KeepLattice::kFirst5 + d);
+   }
+
    score_.resize(NUM_DICE_COMBOS);
    yahtzee_face_.resize(NUM_DICE_COMBOS);
    for (int d = 0; d < NUM_DICE_COMBOS; d++) {
      const std::vector<int>& dice = indexer_5_.GetDice(d);
      for (int c = 0; c < NUM_CATS; c++) score_[d][c] = CalculateScore(c, dice);
      yahtzee_face_[d] = HasNOfAKind(dice, 5) ? dice[0] : 0;
-   }
-
-   reachable_[0] = 1;  // no upper category filled -> upper = 0
-   for (int m = 1; m < 64; m++) {
-     int i = __builtin_ctz(m);
-     uint64_t prev = reachable_[m & (m - 1)];
-     uint64_t r = 0;
-     for (int u = 0; u < MAX_UPPER_SCORE; u++) {
-       if (!((prev >> u) & 1)) continue;
-       for (int c = 0; c <= 5; c++) r |= 1ULL << std::min(63, u + c * (i + 1));
-     }
-     reachable_[m] = r;
-   }
- }
-
- void YahtzeeSolver::RerollStage(const float* in, float* out, double* exp) const {
-   for (int d = 0; d < NUM_DICE_COMBOS; d++) exp[kFirst5 + d] = in[d];
-   for (int i = kFirst5 - 1; i >= 0; i--) {
-     const auto& ch = children_[i];
-     exp[i] = (exp[ch[0]] + exp[ch[1]] + exp[ch[2]] +
-               exp[ch[3]] + exp[ch[4]] + exp[ch[5]]) * (1.0 / 6.0);
-   }
-   for (int d = 0; d < NUM_DICE_COMBOS; d++) {
-     double best = 0.0;
-     for (int sid : valid_subsets_for_outcome_[d]) {
-       if (exp[sid] > best) best = exp[sid];
-     }
-     out[d] = static_cast<float>(best);
-   }
- }
- 
- void YahtzeeSolver::AllocateTables() {
-   std::cout << "\nAllocating memory..." << std::endl;
-   board_ev_.assign(BOARD_STATE_SIZE, 0.0f);
-   std::cout << "  board_ev: " 
-             << BOARD_STATE_SIZE * sizeof(float) / (1024 * 1024) 
-             << " MB (roll tables are streamed to disk)\n" << std::endl;
- }
-
- void YahtzeeSolver::WriteAt(size_t offset, const void* data, size_t bytes) const {
-   const char* p = static_cast<const char*>(data);
-   while (bytes > 0) {
-     ssize_t n = pwrite(out_fd_, p, bytes, static_cast<off_t>(offset));
-     if (n < 0) {
-       if (errno == EINTR) continue;
-       std::perror("FATAL: pwrite failed");
-       std::exit(1);
-     }
-     p += n;
-     offset += n;
-     bytes -= n;
    }
  }
  
@@ -579,21 +420,14 @@
    return {max_val, best_cat};
  }
  
- void YahtzeeSolver::Solve(const std::string& filename) {
-  std::cout << "Writing strategy to " << filename << std::endl;
-  out_fd_ = open(filename.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
-  if (out_fd_ < 0 || ftruncate(out_fd_, static_cast<off_t>(kFileBytes)) != 0) {
-    std::perror("FATAL: could not create output file");
-    std::exit(1);
-  }
-
+ void YahtzeeSolver::Solve() {
   std::cout << "Starting optimization (reverse induction)...\n" << std::endl;
   
   // Temporary arrays for computation
   std::vector<float> term_values(NUM_DICE_COMBOS);
   std::vector<float> roll2_values(NUM_DICE_COMBOS);
   std::vector<float> roll1_values(NUM_DICE_COMBOS);
-  std::vector<double> subset_exp(all_subsets_dice_.size());
+  std::vector<double> subset_exp(KeepLattice::kNumSubsets);
 
   // Process states in reverse order of TOTAL categories filled (including Yahtzee)
   // Total filled = popcount(mask) + (y_state > 0 ? 1 : 0)
@@ -628,36 +462,21 @@
       int mask = states[si].first;
       int y_state = states[si].second;
       
-      const uint64_t reach = reachable_[mask & 63];
-
       for (int upper = 0; upper < MAX_UPPER_SCORE; ++upper) {
-        // Unreachable upper totals are never visited from the start state
-        if (!((reach >> upper) & 1)) continue;
-
         // Stage 1: Terminal values (best scoring move for each dice outcome)
         for (int d = 0; d < NUM_DICE_COMBOS; ++d) {
           term_values[d] = GetBestScoringMove(d, mask, upper, y_state).first;
         }
 
         // Stage 2: Roll2 optimization (1 roll left)
-        RerollStage(term_values.data(), roll2_values.data(), subset_exp.data());
-        WriteRollRow(kRoll2Offset, mask, upper, y_state, roll2_values.data());
+        lattice_.Reroll(term_values.data(), roll2_values.data(), subset_exp.data());
 
         // Stage 3: Roll1 optimization (2 rolls left)
-        RerollStage(roll2_values.data(), roll1_values.data(), subset_exp.data());
-        WriteRollRow(kRoll1Offset, mask, upper, y_state, roll1_values.data());
+        lattice_.Reroll(roll2_values.data(), roll1_values.data(), subset_exp.data());
 
         // Stage 4: Start of turn = expectation over the initial roll (keep nothing)
-        for (int d = 0; d < NUM_DICE_COMBOS; d++) {
-          subset_exp[kFirst5 + d] = roll1_values[d];
-        }
-        for (int i = kFirst5 - 1; i >= 0; i--) {
-          const auto& ch = children_[i];
-          subset_exp[i] = (subset_exp[ch[0]] + subset_exp[ch[1]] + subset_exp[ch[2]] +
-                           subset_exp[ch[3]] + subset_exp[ch[4]] + subset_exp[ch[5]]) *
-                          (1.0 / 6.0);
-        }
-        float start_ev = static_cast<float>(subset_exp[0]);
+        float start_ev = static_cast<float>(
+            lattice_.InitialRoll(roll1_values.data(), subset_exp.data()));
         
         SetBoardEV(mask, upper, y_state, start_ev);
       }
@@ -670,24 +489,37 @@
   }
   
   std::cout << "\nOptimization complete!" << std::endl;
-
-  // Header and board table go at the front; roll rows are already written
-  uint32_t header[4] = {
-      0x59414854,  // "YAHT"
-      3,           // version
-      static_cast<uint32_t>(BOARD_STATE_SIZE),
-      static_cast<uint32_t>(ROLL_STATE_SIZE)};
-  WriteAt(0, header, sizeof(header));
-  WriteAt(kHeaderBytes, board_ev_.data(), board_ev_.size() * sizeof(float));
-  if (close(out_fd_) != 0) {
-    std::perror("FATAL: close failed");
-    std::exit(1);
-  }
-  out_fd_ = -1;
-
-  std::cout << "Strategy saved successfully" << std::endl;
-  std::cout << "  File size: " << kFileBytes / (1024 * 1024) << " MB" << std::endl;
 }
+
+ void YahtzeeSolver::SaveToFile(const std::string& filename) const {
+   std::cout << "\nSaving strategy to " << filename << "..." << std::endl;
+   
+   std::ofstream out(filename, std::ios::binary);
+   if (!out) {
+     std::cerr << "Error: Could not open file for writing" << std::endl;
+     std::exit(1);
+   }
+   
+   // Header (version 4: board EVs only, roll_size = 0)
+   uint32_t header[4] = {
+       0x59414854,  // "YAHT"
+       4,           // version
+       static_cast<uint32_t>(BOARD_STATE_SIZE),
+       0};          // roll_size
+   out.write(reinterpret_cast<const char*>(header), sizeof(header));
+   out.write(reinterpret_cast<const char*>(board_ev_.data()), 
+             board_ev_.size() * sizeof(float));
+   out.close();
+   if (!out) {
+     std::cerr << "Error: Failed to write " << filename << std::endl;
+     std::exit(1);
+   }
+   
+   std::cout << "Strategy saved successfully" << std::endl;
+   std::cout << "  Board EVs: " << board_ev_.size() << " entries ("
+             << (sizeof(header) + board_ev_.size() * sizeof(float)) / 1024
+             << " KB)" << std::endl;
+ }
  
  // -------------------------------------------------------------------------
  // MAIN
@@ -696,12 +528,13 @@
  #ifndef BUILD_GUIDE
  int main() {
    std::cout << "=== Yahtzee Optimal Strategy Solver (Optimized) ===" << std::endl;
-   std::cout << "Version: 3 (Mid-turn storage, float precision)\n" << std::endl;
+   std::cout << "Version: 4 (start-of-turn EVs only, float precision)\n" << std::endl;
    
    auto start_time = std::chrono::high_resolution_clock::now();
    
    YahtzeeSolver solver;
-   solver.Solve("yahtzee_optimal_v3.bin");
+   solver.Solve();
+   solver.SaveToFile("yahtzee_optimal_v4.bin");
    
    auto end_time = std::chrono::high_resolution_clock::now();
    auto duration = std::chrono::duration_cast<std::chrono::seconds>(

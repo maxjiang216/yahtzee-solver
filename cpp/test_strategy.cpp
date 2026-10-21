@@ -17,7 +17,7 @@
 void TestYahtzeeScoring() {
   std::cout << "\n=== Test 1: Yahtzee Scoring (50 vs 0) ===" << std::endl;
   
-  YahtzeeStrategy strategy("yahtzee_optimal_v3.bin");
+  YahtzeeStrategy strategy("yahtzee_optimal_v4.bin");
   
   int failures = 0;
   int tests = 0;
@@ -76,7 +76,7 @@ void TestYahtzeeScoring() {
 void TestUpperScoreMonotonicity() {
   std::cout << "\n=== Test 2: Upper Score Monotonicity ===" << std::endl;
   
-  YahtzeeStrategy strategy("yahtzee_optimal_v3.bin");
+  YahtzeeStrategy strategy("yahtzee_optimal_v4.bin");
   
   int failures = 0;
   int tests = 0;
@@ -131,7 +131,7 @@ void TestUpperScoreMonotonicity() {
 void TestYahtzeeOpenVsScoredZero() {
   std::cout << "\n=== Test 3: Yahtzee Open vs Scored Zero ===" << std::endl;
   
-  YahtzeeStrategy strategy("yahtzee_optimal_v3.bin");
+  YahtzeeStrategy strategy("yahtzee_optimal_v4.bin");
   
   int failures = 0;
   int tests = 0;
@@ -191,7 +191,7 @@ void TestYahtzeeOpenVsScoredZero() {
 void TestSpecificCases() {
   std::cout << "\n=== Test 4: Specific Test Cases ===" << std::endl;
   
-  YahtzeeStrategy strategy("yahtzee_optimal_v3.bin");
+  YahtzeeStrategy strategy("yahtzee_optimal_v4.bin");
   
   // Test case 1: Empty board, Yahtzee scored differently
   std::cout << "\nCase 1: Empty board (mask=0, upper=0)" << std::endl;

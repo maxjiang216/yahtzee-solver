@@ -18,6 +18,9 @@ SOLVER_SRC = cpp/yahtzee_optimized_solver.cpp
 STRATEGY_SRC = cpp/yahtzee_strategy.cpp
 GUIDE_SRC = cpp/yahtzee_guide_v3.cpp
 
+# Shared header
+LATTICE_HDR = cpp/yahtzee_keep_lattice.h
+
 # Object files
 SOLVER_OBJ = yahtzee_optimized_solver.o
 STRATEGY_OBJ = yahtzee_strategy.o
@@ -29,7 +32,7 @@ GUIDE_BIN = yahtzee_guide
 TEST_BIN = test_strategy
 
 # Strategy file
-STRATEGY_FILE = yahtzee_optimal_v3.bin
+STRATEGY_FILE = yahtzee_optimal_v4.bin
 PMF_FILE = yahtzee_pmf_v1.bin
 PMF_BIN = yahtzee_pmf_solver
 RATIONAL_BIN = yahtzee_rational_solver
@@ -47,7 +50,7 @@ $(PMF_BIN): cpp/yahtzee_pmf_solver.cpp
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $<
 	@echo "PMF solver built. Run 'make pmf-solve' to generate $(PMF_FILE)"
 
-# Run PMF solver (requires yahtzee_optimal_v3.bin)
+# Run PMF solver (requires yahtzee_optimal_v4.bin)
 .PHONY: pmf-solve
 pmf-solve: $(PMF_BIN)
 	@if [ ! -f $(STRATEGY_FILE) ]; then \
@@ -75,7 +78,7 @@ rational-solve: $(RATIONAL_BIN)
 .PHONY: solver
 solver: $(SOLVER_BIN)
 
-$(SOLVER_BIN): $(SOLVER_SRC)
+$(SOLVER_BIN): $(SOLVER_SRC) $(LATTICE_HDR)
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $<
 	@echo ""
 	@echo "Solver built successfully!"
@@ -86,7 +89,7 @@ $(SOLVER_BIN): $(SOLVER_SRC)
 .PHONY: demo
 demo: $(DEMO_BIN)
 
-$(DEMO_BIN): $(STRATEGY_SRC)
+$(DEMO_BIN): $(STRATEGY_SRC) cpp/yahtzee_strategy.h $(LATTICE_HDR)
 	$(CXX) $(CXXFLAGS) -DBUILD_DEMO -o $@ $<
 	@echo ""
 	@echo "Demo built successfully!"
@@ -98,8 +101,8 @@ $(DEMO_BIN): $(STRATEGY_SRC)
 .PHONY: guide
 guide: $(GUIDE_BIN)
 
-$(GUIDE_BIN): $(GUIDE_SRC) $(STRATEGY_SRC)
-	$(CXX) $(CXXFLAGS) -o $@ $^
+$(GUIDE_BIN): $(GUIDE_SRC) $(STRATEGY_SRC) cpp/yahtzee_strategy.h $(LATTICE_HDR)
+	$(CXX) $(CXXFLAGS) -o $@ $(filter %.cpp,$^)
 	@echo ""
 	@echo "Guide built successfully!"
 	@echo "Run './$(GUIDE_BIN) $(STRATEGY_FILE)' to use the interactive guide"
@@ -108,7 +111,7 @@ $(GUIDE_BIN): $(GUIDE_SRC) $(STRATEGY_SRC)
 # Run solver to generate strategy file
 .PHONY: solve
 solve: $(SOLVER_BIN)
-	@echo "Running solver (~9 s; streams the 1.5 GB table to disk)..."
+	@echo "Running solver (~4 s)..."
 	@echo ""
 	./$(SOLVER_BIN)
 	@echo ""
@@ -120,8 +123,8 @@ solve: $(SOLVER_BIN)
 .PHONY: test-build
 test-build: $(TEST_BIN)
 
-$(TEST_BIN): cpp/test_strategy.cpp $(STRATEGY_SRC)
-	$(CXX) $(CXXFLAGS) -o $@ $^
+$(TEST_BIN): cpp/test_strategy.cpp $(STRATEGY_SRC) cpp/yahtzee_strategy.h $(LATTICE_HDR)
+	$(CXX) $(CXXFLAGS) -o $@ $(filter %.cpp,$^)
 	@echo ""
 	@echo "Test built successfully!"
 	@echo "Run './$(TEST_BIN)' to run unit tests"
@@ -172,7 +175,7 @@ help:
 	@echo "  make rational  - Build the exact rational EV solver"
 	@echo "  make rational-solve - Compute the exact EV table (~5 s)"
 	@echo "  make all       - Build solver and demo"
-	@echo "  make solve     - Run solver to generate strategy file (~9 s)"
+	@echo "  make solve     - Run solver to generate strategy file (~4 s)"
 	@echo "  make test      - Run demo to test the strategy"
 	@echo "  make clean     - Remove executables and object files"
 	@echo "  make distclean - Remove everything including strategy file"

@@ -18,7 +18,7 @@ int main() {
   std::cout << "Testing Dice Transition Probabilities" << std::endl;
   std::cout << "=====================================" << std::endl;
   
-  YahtzeeStrategy strategy("yahtzee_optimal_v3.bin");
+  YahtzeeStrategy strategy("yahtzee_optimal_v4.bin");
   
   // Force initialization of transitions
   std::vector<int> dummy_dice = {1, 2, 3, 4, 5};

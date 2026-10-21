@@ -4,7 +4,7 @@
 
 `yahtzee_pmf_solver.cpp` computes, for every reachable Yahtzee board state, the full probability distribution of remaining score under optimal solo play. The output is `yahtzee_pmf_v1.bin`, which is used by the 2-player NN as a near-optimal win-probability feature (P_baseline).
 
-Formally: for each state `(mask, upper, y_state)`, the PMF gives `P(future_score = s)` for all `s` from 0 to 1575 (the exact theoretical maximum), where score is measured from this state forward, and optimal play is defined by `yahtzee_optimal_v3.bin`.
+Formally: for each state `(mask, upper, y_state)`, the PMF gives `P(future_score = s)` for all `s` from 0 to 1575 (the exact theoretical maximum), where score is measured from this state forward, and optimal play is defined by `yahtzee_optimal_v4.bin`.
 
 ---
 
@@ -44,7 +44,7 @@ P(all 13 Yahtzees) ≈ (4.6%)^13 ≈ 10⁻²⁴ — astronomically rare, but cov
 
 ## Algorithm
 
-Standard reverse induction. States are processed from `total_filled = 13` down to `0`. For each board state, optimal keep decisions and scoring choices are derived from the preloaded EV strategy (`board_ev_`, `roll1_ev_`, `roll2_ev_` tables from `yahtzee_optimal_v3.bin`).
+Standard reverse induction. States are processed from `total_filled = 13` down to `0`. For each board state, optimal keep decisions and scoring choices are derived from the preloaded start-of-turn EVs (`board_ev_` from `yahtzee_optimal_v4.bin`; a version 3 file also works, and its mid-turn tables are ignored).
 
 ### Per-state computation — three optimizations
 
@@ -54,10 +54,11 @@ The naive implementation called `GetOptimalScoringMove` inside `GetOptimalKeep(.
 
 ```
 subset_ev[k] = Σ_d  trans_probs[k][d] × term_ev[d]      (for keep2)
+roll2_ev[d] = max_{k ∈ valid_subsets(d)} subset_ev[k]
 subset_r2_ev[k] = Σ_d  trans_probs[k][d] × roll2_ev[d]  (for keep1)
 ```
 
-Then `keep_for[d] = argmax_{k ∈ valid_subsets(d)} subset_ev[k]`. Total: 462 × 252 = 116K multiplications vs. ~800K scoring calls. Same pattern as the booty-dice solver's backward EV propagation.
+Then `keep_for[d] = argmax_{k ∈ valid_subsets(d)} subset_ev[k]`. `roll2_ev` is recomputed per state this way rather than loaded, so the EV file only needs start-of-turn values. Total: 462 × 252 = 116K multiplications vs. ~800K scoring calls. Same pattern as the booty-dice solver's backward EV propagation.
 
 **2. Three-pass PMF accumulation (matrix products)**
 

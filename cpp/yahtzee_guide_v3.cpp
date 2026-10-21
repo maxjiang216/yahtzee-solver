@@ -9,7 +9,7 @@
  * 
  * USAGE:
  *   ./yahtzee_guide [strategy_file.bin]
- *   Default: yahtzee_optimal_v3.bin
+ *   Default: yahtzee_optimal_v4.bin
  * 
  * INPUT FORMAT:
  *   - Dice: Enter as digits like "12345" or space-separated "1 2 3 4 5"
@@ -214,7 +214,7 @@ int BuildFullMask(int mask, int y_state) {
  }
  
  int main(int argc, char* argv[]) {
-     std::string strategy_file = "yahtzee_optimal_v3.bin";
+     std::string strategy_file = "yahtzee_optimal_v4.bin";
      if (argc > 1) {
          strategy_file = argv[1];
      }

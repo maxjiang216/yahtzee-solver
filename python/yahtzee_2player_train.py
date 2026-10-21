@@ -31,7 +31,7 @@ from yahtzee_2player_env import (
     ALL_SUBSETS, DICE_TO_ID,
     BOARD_STATE_SIZE, DENSE_SIZE, DENSE_MAX,
     board_index, cats_filled, get_best_scoring_move,
-    extract_features, compute_p_baseline, load_roll_tables, load_pmf_table,
+    extract_features, compute_p_baseline, load_ev_table, load_pmf_table,
     simulate_turn_solo_optimal,
 )
 from yahtzee_2player_nn import YahtzeeValueNet, YahtzeeInference, EMANet
@@ -40,7 +40,7 @@ from yahtzee_2player_nn import YahtzeeValueNet, YahtzeeInference, EMANet
 # Paths
 # ---------------------------------------------------------------------------
 
-EV_FILE  = 'yahtzee_optimal_v3.bin'
+EV_FILE  = 'yahtzee_optimal_v4.bin'
 PMF_FILE = 'yahtzee_pmf_v1.bin'
 CKPT_DIR = Path('checkpoints_2player')
 
@@ -51,7 +51,7 @@ CKPT_DIR = Path('checkpoints_2player')
 
 
 
-def generate_bootstrap_data(n_games, board_ev, roll1_ev, roll2_ev, pmf_dense):
+def generate_bootstrap_data(n_games, board_ev, pmf_dense):
     """
     Play n_games with both players using solo-optimal strategy.
     For each turn-start state, record (features, P_baseline) as a training pair.
@@ -76,7 +76,7 @@ def generate_bootstrap_data(n_games, board_ev, roll1_ev, roll2_ev, pmf_dense):
             labels_list.append(p_base)   # bootstrap label = P_baseline
 
             pts, nm1, nu1, ny1 = simulate_turn_solo_optimal(
-                mask1, upper1, y1, board_ev, roll2_ev)
+                mask1, upper1, y1, board_ev)
             mask1, upper1, y1 = nm1, nu1, ny1
             score1 += pts
 
@@ -90,7 +90,7 @@ def generate_bootstrap_data(n_games, board_ev, roll1_ev, roll2_ev, pmf_dense):
             labels_list.append(p_base2)
 
             pts2, nm2, nu2, ny2 = simulate_turn_solo_optimal(
-                mask2, upper2, y2, board_ev, roll2_ev)
+                mask2, upper2, y2, board_ev)
             mask2, upper2, y2 = nm2, nu2, ny2
             score2 += pts2
 
@@ -102,13 +102,13 @@ def generate_bootstrap_data(n_games, board_ev, roll1_ev, roll2_ev, pmf_dense):
 def phase2_train(model, n_games=200_000, batch_size=4096, lr=3e-4, device='cuda'):
     print('\n=== Phase 2: Supervised bootstrap ===')
     print('Loading EV and PMF tables...')
-    board_ev, roll1_ev, roll2_ev = load_roll_tables(EV_FILE)
+    board_ev = load_ev_table(EV_FILE)
     pmf_dense = load_pmf_table(PMF_FILE)
     print('Tables loaded.')
 
     print(f'Generating {n_games} games of bootstrap data...')
     t0 = time.time()
-    X, y = generate_bootstrap_data(n_games, board_ev, roll1_ev, roll2_ev, pmf_dense)
+    X, y = generate_bootstrap_data(n_games, board_ev, pmf_dense)
     print(f'  {len(X)} samples in {time.time()-t0:.1f}s')
 
     model = model.to(device).train()
@@ -232,7 +232,7 @@ def compute_td_targets(states_batch, opp_board, diff_batch, pmf_dense,
 
 
 def play_td_game(mask1, upper1, y1, mask2, upper2, y2,
-                 board_ev, roll1_ev, roll2_ev, pmf_dense,
+                 board_ev, pmf_dense,
                  inference):
     """
     Play a single game using the NN for strategy. Collect (state, opp, diff, td_target) tuples.
@@ -251,7 +251,7 @@ def play_td_game(mask1, upper1, y1, mask2, upper2, y2,
             'diff': diff,
         })
         pts, nm1, nu1, ny1 = simulate_turn_solo_optimal(
-            mask1, upper1, y1, board_ev, roll2_ev)
+            mask1, upper1, y1, board_ev)
         mask1, upper1, y1 = nm1, nu1, ny1
         score1 += pts
 
@@ -262,7 +262,7 @@ def play_td_game(mask1, upper1, y1, mask2, upper2, y2,
             'diff': diff2,
         })
         pts2, nm2, nu2, ny2 = simulate_turn_solo_optimal(
-            mask2, upper2, y2, board_ev, roll2_ev)
+            mask2, upper2, y2, board_ev)
         mask2, upper2, y2 = nm2, nu2, ny2
         score2 += pts2
 
@@ -272,7 +272,7 @@ def play_td_game(mask1, upper1, y1, mask2, upper2, y2,
 def phase3_train(model, n_iters=1000, games_per_iter=1000, batch_size=4096,
                  lr=3e-4, ema_decay=0.999, device='cuda', save_every=100):
     print('\n=== Phase 3: TD self-play RL ===')
-    board_ev, roll1_ev, roll2_ev = load_roll_tables(EV_FILE)
+    board_ev = load_ev_table(EV_FILE)
     pmf_dense = load_pmf_table(PMF_FILE)
     print('Tables loaded.')
 
@@ -297,7 +297,7 @@ def phase3_train(model, n_iters=1000, games_per_iter=1000, batch_size=4096,
         new_experiences = []
         for _ in range(games_per_iter):
             exp, winner = play_td_game(0, 0, 0, 0, 0, 0,
-                                       board_ev, roll1_ev, roll2_ev, pmf_dense,
+                                       board_ev, pmf_dense,
                                        inference)
             new_experiences.extend(exp)
 

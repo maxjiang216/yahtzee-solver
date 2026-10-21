@@ -6,6 +6,8 @@
 #include <memory>
 #include <map>
 
+#include "yahtzee_keep_lattice.h"
+
 // -------------------------------------------------------------------------
 // SCORING FUNCTIONS (forward declarations)
 // -------------------------------------------------------------------------
@@ -41,7 +43,6 @@ const int NUM_DICE_COMBOS = 252;
 
 // State space sizes
 const int BOARD_STATE_SIZE = NUM_BOARD_MASKS * MAX_UPPER_SCORE * NUM_Y_STATES;
-const int ROLL_STATE_SIZE = BOARD_STATE_SIZE * NUM_DICE_COMBOS;
 
 // -------------------------------------------------------------------------
 // DICE INDEXER
@@ -68,11 +69,12 @@ class DiceIndexer {
 /**
  * YahtzeeStrategy: Fast query interface for optimal decisions
  * 
- * Loads precomputed tables and provides two main query functions:
+ * Loads the start-of-turn EV table (3 MB) and provides two main queries:
  * 1. GetOptimalCategory() - Which category to score in
  * 2. GetOptimalKeep() - Which dice to keep for reroll
  * 
- * All queries use O(1) array lookups for maximum speed.
+ * Mid-turn values are recomputed from the board EVs with KeepLattice:
+ * one keep query is 252 scoring evaluations plus one or two lattice passes.
  */
 class YahtzeeStrategy {
  public:
@@ -140,46 +142,22 @@ class YahtzeeStrategy {
       std::vector<int> dice, int mask, int upper, int y_state, int top_n = 3) const;
 
  private:
-  // Loaded tables
+  // Loaded start-of-turn EV table
   std::vector<float> board_ev_;
-  std::vector<float> roll1_ev_;
-  std::vector<float> roll2_ev_;
 
-  // Lazy-initialized dice indexer
-  mutable std::unique_ptr<DiceIndexer> indexer_ptr_;
+  DiceIndexer indexer_;
+  KeepLattice lattice_;
 
-  // Transition probabilities (lazy-initialized)
-  mutable bool transitions_initialized_;
-  mutable std::map<std::vector<int>, int> subset_to_id_;
-  mutable std::vector<std::vector<int>> all_subsets_dice_;
-  mutable std::vector<std::vector<float>> trans_probs_;
-
-  // Helper functions
-  const DiceIndexer& GetIndexer() const;
-  void InitializeTransitions() const;
-
-  // Indexing functions
+  // Indexing function
   inline size_t BoardIndex(int mask, int upper, int y_state) const {
     // Strip bit 12 from mask, as Yahtzee is handled by y_state
     mask &= ~(1 << CAT_YAHTZEE);
     return (mask * MAX_UPPER_SCORE + upper) * NUM_Y_STATES + y_state;
   }
 
-  inline size_t RollIndex(int mask, int upper, int y_state, int dice_id) const {
-    // Strip bit 12 from mask, as Yahtzee is handled by y_state
-    mask &= ~(1 << CAT_YAHTZEE);
-    return ((mask * MAX_UPPER_SCORE + upper) * NUM_Y_STATES + y_state) * 
-           NUM_DICE_COMBOS + dice_id;
-  }
-
-  // EV accessors for roll states
-  inline float GetRoll1EV(int mask, int upper, int y_state, int dice_id) const {
-    return roll1_ev_[RollIndex(mask, upper, y_state, dice_id)];
-  }
-
-  inline float GetRoll2EV(int mask, int upper, int y_state, int dice_id) const {
-    return roll2_ev_[RollIndex(mask, upper, y_state, dice_id)];
-  }
+  // exp[sid] = EV of keeping subset sid with rolls_left (1 or 2) rolls left
+  void KeepExpectations(int mask, int upper, int y_state, int rolls_left,
+                        double* exp) const;
 
   // Best scoring move helper
   std::pair<float, int> GetBestScoringMove(int dice_id, int mask, int upper, 
