@@ -10,6 +10,13 @@
  * - Direct array indexing (no hash maps)
  * - Float precision (4 bytes vs 8 bytes)
  * - Packed state representation
+ *
+ * SPEED:
+ * ======
+ * - Rerolls use the keep lattice E[K] = (1/6) * sum_f E[K + {f}] (accumulated
+ *   in double) instead of a 462x252 transition matrix
+ * - Scores are looked up from a precomputed 252x13 table
+ * - Only reachable upper totals are solved; unreachable entries stay 0
  * 
  * Total storage: ~1.59 GB
  *   - Board EVs (start of turn): 3.1 MB
@@ -46,6 +53,8 @@
  #include <functional>
  #include <memory>
  #include <cstring>
+ #include <array>
+ #include <cstdint>
  
  // -------------------------------------------------------------------------
  // CONSTANTS
@@ -204,7 +213,8 @@
   public:
    YahtzeeSolver() : indexer_5_(5) {
      InitDiceSubsets();
-     BuildTransitionMatrix();
+     BuildKeepLattice();
+     BuildScoreTables();
      AllocateTables();
    }
  
@@ -220,8 +230,18 @@
    std::vector<std::vector<int>> all_subsets_dice_;  // All 462 subsets (0-5 dice)
    std::map<std::vector<int>, int> subset_to_id_;
  
-   // Transition probabilities: trans_probs[subset_id][outcome_id] = probability
-   std::vector<std::vector<float>> trans_probs_;
+   // Keep lattice: subset ids are ordered by size, so the 252 five-dice
+   // subsets occupy ids [kFirst5, 462) in indexer_5_ order.
+   // children_[id][f-1] = id of subset + {f}, for subsets with < 5 dice.
+   static const int kFirst5 = 462 - NUM_DICE_COMBOS;
+   std::vector<std::array<int, 6>> children_;
+
+   // Precomputed per-outcome scores and Yahtzee face (0 if not a Yahtzee)
+   std::vector<std::array<int, NUM_CATS>> score_;
+   std::vector<int> yahtzee_face_;
+
+   // reachable_[upper_mask6] bit u set if upper total u (capped) is reachable
+   std::array<uint64_t, 64> reachable_;
    
    // Optimization: valid_subsets_for_outcome[outcome_id] = list of subset_ids
    std::vector<std::vector<int>> valid_subsets_for_outcome_;
@@ -277,8 +297,13 @@
  
    // Helper functions
    void InitDiceSubsets();
-   void BuildTransitionMatrix();
+   void BuildKeepLattice();
+   void BuildScoreTables();
    void AllocateTables();
+
+   // One reroll decision: E[K] = (1/6) * sum_f E[K + {f}] down the lattice,
+   // then out[d] = best keep of outcome d. exp is scratch of size 462.
+   void RerollStage(const float* in, float* out, double* exp) const;
    
    // Get best scoring move for a dice outcome
    std::pair<float, int> GetBestScoringMove(int dice_id, int mask, int upper, 
@@ -297,36 +322,22 @@
              << " dice subsets (0-5 dice)" << std::endl;
  }
  
- void YahtzeeSolver::BuildTransitionMatrix() {
-   std::cout << "Building transition probability matrix..." << std::endl;
-   
-   trans_probs_.assign(all_subsets_dice_.size(), 
-                       std::vector<float>(NUM_DICE_COMBOS, 0.0f));
- 
-   // For each possible subset to keep
-   for (size_t i = 0; i < all_subsets_dice_.size(); i++) {
-     std::vector<int> kept = all_subsets_dice_[i];
-     int needed = 5 - kept.size();
-     long long total = std::pow(6, needed);
-     
-     // Enumerate all possible rerolls
-     for (long long j = 0; j < total; j++) {
-       std::vector<int> current = kept;
-       long long temp = j;
-       for (int r = 0; r < needed; r++) {
-         current.push_back((temp % 6) + 1);
-         temp /= 6;
-       }
-       int final_id = indexer_5_.GetId(current);
-       trans_probs_[i][final_id] += 1.0f;
-     }
-     
-     // Normalize to probabilities
-     for (int d = 0; d < NUM_DICE_COMBOS; d++) {
-       trans_probs_[i][d] /= static_cast<float>(total);
+ void YahtzeeSolver::BuildKeepLattice() {
+   std::cout << "Building keep lattice..." << std::endl;
+
+   children_.resize(kFirst5);
+   for (int i = 0; i < kFirst5; i++) {
+     for (int f = 1; f <= 6; f++) {
+       std::vector<int> c = all_subsets_dice_[i];
+       c.push_back(f);
+       std::sort(c.begin(), c.end());
+       children_[i][f - 1] = subset_to_id_.at(c);
      }
    }
- 
+   for (int d = 0; d < NUM_DICE_COMBOS; d++) {
+     assert(subset_to_id_.at(indexer_5_.GetDice(d)) == kFirst5 + d);
+   }
+
    // Precompute valid subsets for each outcome
    valid_subsets_for_outcome_.resize(NUM_DICE_COMBOS);
    for (int d = 0; d < NUM_DICE_COMBOS; d++) {
@@ -349,7 +360,45 @@
                                          valid_subsets_for_outcome_[d].end());
    }
    
-   std::cout << "Transition matrix built successfully" << std::endl;
+   std::cout << "Keep lattice built successfully" << std::endl;
+ }
+
+ void YahtzeeSolver::BuildScoreTables() {
+   score_.resize(NUM_DICE_COMBOS);
+   yahtzee_face_.resize(NUM_DICE_COMBOS);
+   for (int d = 0; d < NUM_DICE_COMBOS; d++) {
+     const std::vector<int>& dice = indexer_5_.GetDice(d);
+     for (int c = 0; c < NUM_CATS; c++) score_[d][c] = CalculateScore(c, dice);
+     yahtzee_face_[d] = HasNOfAKind(dice, 5) ? dice[0] : 0;
+   }
+
+   reachable_[0] = 1;  // no upper category filled -> upper = 0
+   for (int m = 1; m < 64; m++) {
+     int i = __builtin_ctz(m);
+     uint64_t prev = reachable_[m & (m - 1)];
+     uint64_t r = 0;
+     for (int u = 0; u < MAX_UPPER_SCORE; u++) {
+       if (!((prev >> u) & 1)) continue;
+       for (int c = 0; c <= 5; c++) r |= 1ULL << std::min(63, u + c * (i + 1));
+     }
+     reachable_[m] = r;
+   }
+ }
+
+ void YahtzeeSolver::RerollStage(const float* in, float* out, double* exp) const {
+   for (int d = 0; d < NUM_DICE_COMBOS; d++) exp[kFirst5 + d] = in[d];
+   for (int i = kFirst5 - 1; i >= 0; i--) {
+     const auto& ch = children_[i];
+     exp[i] = (exp[ch[0]] + exp[ch[1]] + exp[ch[2]] +
+               exp[ch[3]] + exp[ch[4]] + exp[ch[5]]) * (1.0 / 6.0);
+   }
+   for (int d = 0; d < NUM_DICE_COMBOS; d++) {
+     double best = 0.0;
+     for (int sid : valid_subsets_for_outcome_[d]) {
+       if (exp[sid] > best) best = exp[sid];
+     }
+     out[d] = static_cast<float>(best);
+   }
  }
  
  void YahtzeeSolver::AllocateTables() {
@@ -410,9 +459,9 @@
      return {0.0f, 0};
    }
    
-   std::vector<int> dice = indexer_5_.GetDice(dice_id);
-   bool is_yahtzee = HasNOfAKind(dice, 5);
-   int yahtzee_num = is_yahtzee ? dice[0] : 0;
+   const auto& sc = score_[dice_id];
+   int yahtzee_num = yahtzee_face_[dice_id];
+   bool is_yahtzee = yahtzee_num != 0;
    
    float max_val = -1.0f;
    int best_cat = -1;
@@ -437,7 +486,7 @@
       if (upper_open) {
         // JOKER RULE: Must play in corresponding upper section if open
         // This is mandatory - no choice
-        int score = CalculateScore(upper_idx, dice);
+        int score = sc[upper_idx];
         int next_u = std::min(63, upper + score);
         float u_bonus = (upper < 63 && next_u >= 63) ? 35.0f : 0.0f;
         float val = bonus + score + u_bonus + 
@@ -450,7 +499,7 @@
          for (int c = 6; c < 12; ++c) {  // 6-11 (not including 12=Yahtzee)
            if (!((mask >> c) & 1)) {
              can_play_lower = true;
-             int score = CalculateScore(c, dice);
+             int score = sc[c];
              // Joker guarantees full points
              if (c == 8) score = 25;
              else if (c == 9) score = 30;
@@ -500,7 +549,7 @@
    // Standard case: try all open categories (0-11 in 12-bit mask)
    for (int c = 0; c < 12; ++c) {  // 0-11, NOT including Yahtzee (12)
      if (!((mask >> c) & 1)) {
-       int score = CalculateScore(c, dice);
+       int score = sc[c];
        int next_u = upper;
        float u_bonus = 0.0f;
        
@@ -520,7 +569,7 @@
    
    // Special case: Yahtzee category when we have a non-Yahtzee roll
    // For a non-Yahtzee roll, Yahtzee box can only be scored as zero if still open
-   if (y_state == 0 && !HasNOfAKind(dice, 5)) {  // Yahtzee still open and not a Yahtzee roll
+   if (y_state == 0 && !is_yahtzee) {  // Yahtzee still open and not a Yahtzee roll
      int score = 0; // Must be zero since not a Yahtzee
      int next_y = 1; // Mark Yahtzee as closed (used with no Yahtzee scored)
      float val = GetBoardEV(mask, upper, next_y);
@@ -540,7 +589,7 @@
   std::vector<float> term_values(NUM_DICE_COMBOS);
   std::vector<float> roll2_values(NUM_DICE_COMBOS);
   std::vector<float> roll1_values(NUM_DICE_COMBOS);
-  std::vector<float> subset_exp(all_subsets_dice_.size());
+  std::vector<double> subset_exp(all_subsets_dice_.size());
 
   // Process states in reverse order of TOTAL categories filled (including Yahtzee)
   // Total filled = popcount(mask) + (y_state > 0 ? 1 : 0)
@@ -575,56 +624,40 @@
       int mask = states[si].first;
       int y_state = states[si].second;
       
+      const uint64_t reach = reachable_[mask & 63];
+
       for (int upper = 0; upper < MAX_UPPER_SCORE; ++upper) {
+        // Unreachable upper totals are never visited from the start state
+        if (!((reach >> upper) & 1)) continue;
+
         // Stage 1: Terminal values (best scoring move for each dice outcome)
         for (int d = 0; d < NUM_DICE_COMBOS; ++d) {
           term_values[d] = GetBestScoringMove(d, mask, upper, y_state).first;
         }
 
         // Stage 2: Roll2 optimization (1 roll left)
-        for (size_t s = 0; s < all_subsets_dice_.size(); s++) {
-          float acc = 0.0f;
-          const auto& P = trans_probs_[s];
-          for (int d = 0; d < NUM_DICE_COMBOS; d++) {
-            if (P[d] > 0) acc += P[d] * term_values[d];
-          }
-          subset_exp[s] = acc;
-        }
-        
+        RerollStage(term_values.data(), roll2_values.data(), subset_exp.data());
         for (int d = 0; d < NUM_DICE_COMBOS; d++) {
-          float best = 0.0f;
-          for (int sid : valid_subsets_for_outcome_[d]) {
-            if (subset_exp[sid] > best) best = subset_exp[sid];
-          }
-          roll2_values[d] = best;
-          SetRoll2EV(mask, upper, y_state, d, best);
+          SetRoll2EV(mask, upper, y_state, d, roll2_values[d]);
         }
 
         // Stage 3: Roll1 optimization (2 rolls left)
-        for (size_t s = 0; s < all_subsets_dice_.size(); s++) {
-          float acc = 0.0f;
-          const auto& P = trans_probs_[s];
-          for (int d = 0; d < NUM_DICE_COMBOS; d++) {
-            if (P[d] > 0) acc += P[d] * roll2_values[d];
-          }
-          subset_exp[s] = acc;
-        }
-        
+        RerollStage(roll2_values.data(), roll1_values.data(), subset_exp.data());
         for (int d = 0; d < NUM_DICE_COMBOS; d++) {
-          float best = 0.0f;
-          for (int sid : valid_subsets_for_outcome_[d]) {
-            if (subset_exp[sid] > best) best = subset_exp[sid];
-          }
-          roll1_values[d] = best;
-          SetRoll1EV(mask, upper, y_state, d, best);
+          SetRoll1EV(mask, upper, y_state, d, roll1_values[d]);
         }
 
-        // Stage 4: Start of turn
-        float start_ev = 0.0f;
-        const auto& P_start = trans_probs_[0];
+        // Stage 4: Start of turn = expectation over the initial roll (keep nothing)
         for (int d = 0; d < NUM_DICE_COMBOS; d++) {
-          if (P_start[d] > 0) start_ev += P_start[d] * roll1_values[d];
+          subset_exp[kFirst5 + d] = roll1_values[d];
         }
+        for (int i = kFirst5 - 1; i >= 0; i--) {
+          const auto& ch = children_[i];
+          subset_exp[i] = (subset_exp[ch[0]] + subset_exp[ch[1]] + subset_exp[ch[2]] +
+                           subset_exp[ch[3]] + subset_exp[ch[4]] + subset_exp[ch[5]]) *
+                          (1.0 / 6.0);
+        }
+        float start_ev = static_cast<float>(subset_exp[0]);
         
         SetBoardEV(mask, upper, y_state, start_ev);
       }
