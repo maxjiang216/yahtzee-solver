@@ -1,13 +1,18 @@
-# Large binary data files (regenerable, too large for GitHub)
+# Generated data files (regenerate with make solve / rational-solve / pmf-solve)
 *.bin
+yahtzee_pmf_exact_start.txt
+*.bin.rows
+*.bin.layer0
+*.bin.layer1
 
 # Compiled executables
 yahtzee_solver
-yahtzee_guide
-yahtzee_guide_test
+yahtzee_rational_solver
 yahtzee_pmf_solver
+yahtzee_guide
 strategy_demo
-test_probabilities
+test_strategy
+test_keep_lattice
 
 # Python cache
 __pycache__/

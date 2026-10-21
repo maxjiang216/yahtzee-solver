@@ -1,13 +1,13 @@
 /**
  * Yahtzee Strategy Query Interface
  * 
- * This class loads precomputed strategy tables and provides fast queries
- * for optimal gameplay decisions. Uses the optimized v3 format with
- * mid-turn storage for instant lookups.
+ * This class loads the precomputed start-of-turn EV table and provides
+ * queries for optimal gameplay decisions. Mid-turn values are recomputed
+ * from the board EVs on demand (see yahtzee_keep_lattice.h).
  * 
  * USAGE:
  * ======
- * YahtzeeStrategy strategy("yahtzee_optimal_v3.bin");
+ * YahtzeeStrategy strategy("yahtzee_optimal_v4.bin");
  * 
  * // Get optimal category to score in
  * int category = strategy.GetOptimalCategory(dice, mask, upper, y_state);
@@ -17,11 +17,13 @@
  * 
  * PERFORMANCE:
  * ===========
- * - Load time: ~2 seconds for 1.6 GB file
- * - Query time: O(1) lookups, ~5-50 nanoseconds
- * - Memory: 1.6 GB RAM
- * 
- * Can optionally use memory mapping for lower RAM usage with similar performance.
+ * - Load time: a few milliseconds (3 MB file)
+ * - Category query: up to 13 lookups
+ * - Keep query: 252 scoring evaluations plus 1-2 lattice passes (well under 1 ms)
+ * - Memory: ~3 MB
+ *
+ * Accepts version 4 files (board EVs only) and version 3 files (board EVs
+ * followed by mid-turn tables, which are ignored).
  */
 
 #include "yahtzee_strategy.h"
@@ -38,101 +40,12 @@
 #include <cstring>
 #include <chrono>
  
- // Forward declarations
- bool HasNOfAKind(const std::vector<int>& dice, int n);
- 
- // -------------------------------------------------------------------------
- // DICE INDEXER IMPLEMENTATION
- // -------------------------------------------------------------------------
- 
- DiceIndexer::DiceIndexer(int num_dice) {
-   std::vector<int> current;
-   Generate(current, 1, num_dice);
- }
- 
- int DiceIndexer::GetId(std::vector<int> dice) const {
-   std::sort(dice.begin(), dice.end());
-   return dice_to_id.at(dice);
- }
- 
- const std::vector<int>& DiceIndexer::GetDice(int id) const {
-   return id_to_dice[id];
- }
- 
- void DiceIndexer::Generate(std::vector<int>& current, int start_face, int max_depth) {
-   if (static_cast<int>(current.size()) == max_depth) {
-     dice_to_id[current] = id_to_dice.size();
-     id_to_dice.push_back(current);
-     return;
-   }
-   for (int i = start_face; i <= 6; ++i) {
-     current.push_back(i);
-     Generate(current, i, max_depth);
-     current.pop_back();
-   }
- }
- 
- // -------------------------------------------------------------------------
- // SCORING FUNCTIONS (standalone implementations)
- // -------------------------------------------------------------------------
-
-int GetSum(const std::vector<int>& dice) {
-  return std::accumulate(dice.begin(), dice.end(), 0);
-}
-
-bool HasNOfAKind(const std::vector<int>& dice, int n) {
-  int counts[7] = {0};
-  for (int d : dice) counts[d]++;
-  for (int c : counts) if (c >= n) return true;
-  return false;
-}
-
-bool IsFullHouse(const std::vector<int>& dice) {
-  int counts[7] = {0};
-  for (int d : dice) counts[d]++;
-  bool has3 = false, has2 = false;
-  for (int c : counts) {
-    if (c == 5) return true;  // Joker rule
-    if (c == 3) has3 = true;
-    if (c == 2) has2 = true;
-  }
-  return has3 && has2;
-}
-
-bool IsStraight(const std::vector<int>& dice, int len) {
-  int unique[7] = {0};
-  for (int d : dice) unique[d] = 1;
-  int consec = 0;
-  for (int i = 1; i <= 6; ++i) {
-    if (unique[i]) consec++;
-    else consec = 0;
-    if (consec >= len) return true;
-  }
-  return false;
-}
-
-int CalculateScore(int category, const std::vector<int>& dice) {
-  if (category < 6) {
-    return std::count(dice.begin(), dice.end(), category + 1) * (category + 1);
-  }
-  switch (category) {
-    case 6: return HasNOfAKind(dice, 3) ? GetSum(dice) : 0;
-    case 7: return HasNOfAKind(dice, 4) ? GetSum(dice) : 0;
-    case 8: return IsFullHouse(dice) ? 25 : 0;
-    case 9: return IsStraight(dice, 4) ? 30 : 0;
-    case 10: return IsStraight(dice, 5) ? 40 : 0;
-    case 11: return GetSum(dice);
-    case 12: return HasNOfAKind(dice, 5) ? 50 : 0;
-  }
-  return 0;
-}
-
 // -------------------------------------------------------------------------
 // IMPLEMENTATION
 // -------------------------------------------------------------------------
  
  YahtzeeStrategy::YahtzeeStrategy(const std::string& filename) 
-     : transitions_initialized_(false) {
+     : indexer_(5) {
    std::cout << "Loading strategy from " << filename << "..." << std::flush;
    auto start_time = std::chrono::high_resolution_clock::now();
    
@@ -154,28 +67,24 @@ int CalculateScore(int category, const std::vector<int>& dice) {
      throw std::runtime_error("Invalid file format");
    }
    
-   if (version != 3) {
+   if (version != 3 && version != 4) {
      std::cerr << "\nError: Unsupported version " << version 
-               << " (expected version 3)" << std::endl;
+               << " (expected version 3 or 4)" << std::endl;
      throw std::runtime_error("Unsupported version");
    }
    
-   if (board_size != BOARD_STATE_SIZE || roll_size != ROLL_STATE_SIZE) {
+   // Version 3 files carry mid-turn tables after the board table; they are
+   // not needed (mid-turn values are recomputed), so only the board is read.
+   uint32_t expected_roll = (version == 3) ? BOARD_STATE_SIZE * NUM_DICE_COMBOS : 0;
+   if (board_size != BOARD_STATE_SIZE || roll_size != expected_roll) {
      std::cerr << "\nError: Size mismatch in file" << std::endl;
      throw std::runtime_error("Size mismatch");
    }
    
-   // Read tables
+   // Read board table
    board_ev_.resize(board_size);
-   roll1_ev_.resize(roll_size);
-   roll2_ev_.resize(roll_size);
-   
    in.read(reinterpret_cast<char*>(board_ev_.data()), 
            board_size * sizeof(float));
-   in.read(reinterpret_cast<char*>(roll1_ev_.data()), 
-           roll_size * sizeof(float));
-   in.read(reinterpret_cast<char*>(roll2_ev_.data()), 
-           roll_size * sizeof(float));
    
    if (!in) {
      std::cerr << "\nError: Failed to read strategy data" << std::endl;
@@ -189,180 +98,53 @@ int CalculateScore(int category, const std::vector<int>& dice) {
        end_time - start_time).count();
    
    std::cout << " done (" << duration << " ms)" << std::endl;
-   std::cout << "  Loaded " << board_size << " board states" << std::endl;
-   std::cout << "  Loaded " << roll_size << " roll states (x2)" << std::endl;
-   std::cout << "  Memory usage: " 
-             << (board_size + 2 * roll_size) * sizeof(float) / (1024 * 1024) 
-             << " MB\n" << std::endl;
+   std::cout << "  Loaded " << board_size << " board states (version "
+             << version << ")\n" << std::endl;
  }
  
- const DiceIndexer& YahtzeeStrategy::GetIndexer() const {
-   if (!indexer_ptr_) {
-     indexer_ptr_.reset(new DiceIndexer(5));
+ void YahtzeeStrategy::KeepExpectations(int mask, int upper, int y_state,
+                                        int rolls_left, double* exp) const {
+   // Value of each final roll: best scoring move
+   float term[NUM_DICE_COMBOS];
+   for (int d = 0; d < NUM_DICE_COMBOS; d++) {
+     term[d] = GetBestScoringMove(d, mask, upper, y_state).first;
    }
-   return *indexer_ptr_;
- }
- 
- void YahtzeeStrategy::InitializeTransitions() const {
-   if (transitions_initialized_) return;
-   
-   std::cout << "Initializing transition probabilities..." << std::flush;
-   
-   // Build all subsets (0-5 dice)
-   for (int i = 0; i <= 5; i++) {
-     DiceIndexer tmp(i);
-     for (const auto& d : tmp.id_to_dice) {
-       subset_to_id_[d] = all_subsets_dice_.size();
-       all_subsets_dice_.push_back(d);
-     }
+   if (rolls_left == 1) {
+     lattice_.Expectations(term, exp);
+     return;
    }
-   
-   // Build transition matrix
-   trans_probs_.assign(all_subsets_dice_.size(), 
-                       std::vector<float>(NUM_DICE_COMBOS, 0.0f));
-   
-  for (size_t i = 0; i < all_subsets_dice_.size(); i++) {
-    std::vector<int> kept = all_subsets_dice_[i];
-    int needed = 5 - kept.size();
-    long long total = 1;
-    for (int p = 0; p < needed; p++) total *= 6;
-     
-     for (long long j = 0; j < total; j++) {
-       std::vector<int> current = kept;
-       long long temp = j;
-       for (int r = 0; r < needed; r++) {
-         current.push_back((temp % 6) + 1);
-         temp /= 6;
-       }
-       int final_id = GetIndexer().GetId(current);
-       trans_probs_[i][final_id] += 1.0f;
-     }
-     
-     for (int d = 0; d < NUM_DICE_COMBOS; d++) {
-       trans_probs_[i][d] /= static_cast<float>(total);
-     }
-   }
-   
-   transitions_initialized_ = true;
-   std::cout << " done" << std::endl;
+   // rolls_left == 2: value of each outcome with one roll left, then keep
+   float roll2[NUM_DICE_COMBOS];
+   lattice_.Reroll(term, roll2, exp);
+   lattice_.Expectations(roll2, exp);
  }
  
 float YahtzeeStrategy::GetBoardEV(int mask, int upper, int y_state) const {
-  // Check if all categories are filled (12 non-Yahtzee + Yahtzee filled)
-  int non_yahtzee_mask = mask & ~(1 << 12);  // Strip Yahtzee bit
-  if (non_yahtzee_mask == (1 << 12) - 1 && y_state > 0) return 0.0f;  // All filled
+  if (IsTerminal(mask & FULL_MASK, y_state)) return 0.0f;  // All filled
   return board_ev_[BoardIndex(mask, upper, y_state)];
 }
  
  std::pair<float, int> YahtzeeStrategy::GetBestScoringMove(
      int dice_id, int mask, int upper, int y_state) const {
-   std::vector<int> dice = GetIndexer().GetDice(dice_id);
-   bool is_yahtzee = HasNOfAKind(dice, 5);
-   int yahtzee_num = is_yahtzee ? dice[0] : 0;
-   
+   ScoringOption opts[MAX_SCORING_OPTIONS];
+   int n = rules_.Options(dice_id, mask & FULL_MASK, upper, y_state, opts);
    float max_val = -1.0f;
    int best_cat = -1;
- 
-  // Special case: Yahtzee roll
-  if (is_yahtzee) {
-    if (y_state == 0) {
-      // Yahtzee box open - score 50 points
-      // NOTE: Yahtzee (category 12) is NOT in the 12-bit mask
-      // We only update y_state, not the mask (consistent with solver)
-      float val = 50.0f + GetBoardEV(mask, upper, 2);  // y_state becomes 2
-      if (val > max_val) {
-        max_val = val;
-        best_cat = CAT_YAHTZEE;
-      }
-    } else {
-       // Joker rules
-       float bonus = (y_state == 2) ? 100.0f : 0.0f;
-       int upper_idx = yahtzee_num - 1;
-       bool upper_open = !((mask >> upper_idx) & 1);
- 
-       if (upper_open) {
-         int score = CalculateScore(upper_idx, dice);
-         int next_u = std::min(63, upper + score);
-         float u_bonus = (upper < 63 && next_u >= 63) ? 35.0f : 0.0f;
-         float val = bonus + score + u_bonus + 
-                    GetBoardEV(mask | (1 << upper_idx), next_u, y_state);
-         if (val > max_val) {
-           max_val = val;
-           best_cat = upper_idx;
-         }
-       } else {
-         bool can_play_lower = false;
-         for (int c = 6; c <= 11; ++c) {
-           if (!((mask >> c) & 1)) {
-             can_play_lower = true;
-             int score = CalculateScore(c, dice);
-             if (c == 8) score = 25;
-             else if (c == 9) score = 30;
-             else if (c == 10) score = 40;
-             
-             float val = bonus + score + GetBoardEV(mask | (1 << c), upper, y_state);
-             if (val > max_val) {
-               max_val = val;
-               best_cat = c;
-             }
-           }
-         }
-         
-         if (!can_play_lower) {
-           for (int c = 0; c < 6; ++c) {
-             if (!((mask >> c) & 1)) {
-               float val = bonus + GetBoardEV(mask | (1 << c), upper, y_state);
-               if (val > max_val) {
-                 max_val = val;
-                 best_cat = c;
-               }
-             }
-           }
-         }
-       }
-       return {max_val, best_cat};
+   for (int i = 0; i < n; ++i) {
+     const ScoringOption& o = opts[i];
+     float val = o.reward + GetBoardEV(o.next_mask, o.next_upper, o.next_y_state);
+     if (val > max_val) {
+       max_val = val;
+       best_cat = o.category;
      }
    }
- 
-  // Standard case: try all open categories (0-11 in 12-bit mask, plus Yahtzee separately)
-  for (int c = 0; c < 12; ++c) {  // 0-11, NOT including Yahtzee (12)
-    if (!((mask >> c) & 1)) {
-      int score = CalculateScore(c, dice);
-      int next_u = upper;
-      float u_bonus = 0.0f;
-      
-      if (c < 6) {
-        next_u = std::min(63, upper + score);
-        if (upper < 63 && next_u >= 63) u_bonus = 35.0f;
-      }
-      
-      // Note: c cannot be CAT_YAHTZEE (12) in this loop
-      float val = score + u_bonus + GetBoardEV(mask | (1 << c), next_u, y_state);
-      if (val > max_val) {
-        max_val = val;
-        best_cat = c;
-      }
-    }
-  }
-  
-  // Special case: Yahtzee category when we have a non-Yahtzee roll
-  // For a non-Yahtzee roll, Yahtzee box can only be scored as zero if still open
-  if (y_state == 0 && !HasNOfAKind(dice, 5)) {  // Yahtzee still open and not a Yahtzee roll
-    int score = 0; // Must be zero since not a Yahtzee
-    int next_y = 1; // Mark Yahtzee as closed (used with no Yahtzee scored)
-    float val = GetBoardEV(mask, upper, next_y);
-    if (val > max_val) {
-      max_val = val;
-      best_cat = CAT_YAHTZEE;
-    }
-  }
-   
+   if (n == 0) return {0.0f, -1};  // game over
    return {max_val, best_cat};
  }
  
 int YahtzeeStrategy::GetOptimalCategory(std::vector<int> dice, int mask, 
                                         int upper, int y_state) {
-  int dice_id = GetIndexer().GetId(dice);
+  int dice_id = indexer_.GetId(dice);
   return GetBestScoringMove(dice_id, mask, upper, y_state).second;
 }
 
@@ -419,51 +201,21 @@ std::vector<std::pair<int, float>> YahtzeeStrategy::GetTopCategories(
      return 31;
    }
    
-  // Initialize transitions on first use
-  InitializeTransitions();
-  
-  float best_ev = -1.0f;
-   int best_keep_mask = 0;
- 
-   // Try all 32 possible keep masks
-   for (int k_mask = 0; k_mask < 32; ++k_mask) {
-     // Extract kept dice
-     std::vector<int> kept;
-     for (int i = 0; i < 5; i++) {
-       if ((k_mask >> i) & 1) {
-         kept.push_back(current_dice[i]);
-       }
-     }
-     
-     // Get subset ID for kept dice
-     std::sort(kept.begin(), kept.end());
-     int subset_id = subset_to_id_[kept];
-     
-     // Compute expected value using precomputed transition probabilities
-     float ev = 0.0f;
-     const auto& probs = trans_probs_[subset_id];
-     
-     for (int outcome_id = 0; outcome_id < NUM_DICE_COMBOS; outcome_id++) {
-       if (probs[outcome_id] > 0) {
-         float outcome_value;
-         
-         if (rolls_left == 2) {
-           // After rerolling with 2 rolls left, outcome has 1 roll left -> use roll2_ev
-           outcome_value = GetRoll2EV(mask, upper, y_state, outcome_id);
-         } else {
-           // After rerolling with 1 roll left, outcome has 0 rolls left -> terminal value
-           outcome_value = GetBestScoringMove(outcome_id, mask, upper, y_state).first;
-         }
-         
-         ev += probs[outcome_id] * outcome_value;
-       }
-     }
-     
-     if (ev > best_ev) {
-       best_ev = ev;
-       best_keep_mask = k_mask;
-     }
-   }
+  double exp[KeepLattice::kNumSubsets];
+  KeepExpectations(mask, upper, y_state, rolls_left, exp);
+
+  double best_ev = -1.0;
+  int best_keep_mask = 0;
+
+  // Try all 32 possible keep masks; on exact ties prefer keeping more dice
+  for (int k_mask = 0; k_mask < 32; ++k_mask) {
+    double ev = exp[lattice_.KeptSubset(current_dice, k_mask)];
+    if (ev > best_ev ||
+        (ev == best_ev && __builtin_popcount(k_mask) > __builtin_popcount(best_keep_mask))) {
+      best_ev = ev;
+      best_keep_mask = k_mask;
+    }
+  }
    
   return best_keep_mask;
 }
@@ -479,45 +231,13 @@ std::vector<std::pair<int, float>> YahtzeeStrategy::GetTopKeepChoices(
     return {};
   }
   
-  InitializeTransitions();
-  
+  double exp[KeepLattice::kNumSubsets];
+  KeepExpectations(mask, upper, y_state, rolls_left, exp);
+
   std::vector<std::pair<float, int>> options;  // (expected_value, keep_mask)
-  
-  // Try all 32 possible keep masks
   for (int k_mask = 0; k_mask < 32; ++k_mask) {
-    // Extract kept dice
-    std::vector<int> kept;
-    for (int i = 0; i < 5; i++) {
-      if ((k_mask >> i) & 1) {
-        kept.push_back(current_dice[i]);
-      }
-    }
-    
-    // Get subset ID for kept dice
-    std::sort(kept.begin(), kept.end());
-    int subset_id = subset_to_id_[kept];
-    
-    // Compute expected value using precomputed transition probabilities
-    float ev = 0.0f;
-    const auto& probs = trans_probs_[subset_id];
-    
-    for (int outcome_id = 0; outcome_id < NUM_DICE_COMBOS; outcome_id++) {
-      if (probs[outcome_id] > 0) {
-        float outcome_value;
-        
-        if (rolls_left == 2) {
-          // After rerolling with 2 rolls left, outcome has 1 roll left -> use roll2_ev
-          outcome_value = GetRoll2EV(mask, upper, y_state, outcome_id);
-        } else {
-          // After rerolling with 1 roll left, outcome has 0 rolls left -> terminal value
-          outcome_value = GetBestScoringMove(outcome_id, mask, upper, y_state).first;
-        }
-        
-        ev += probs[outcome_id] * outcome_value;
-      }
-    }
-    
-    options.push_back({ev, k_mask});
+    options.push_back(
+        {static_cast<float>(exp[lattice_.KeptSubset(current_dice, k_mask)]), k_mask});
   }
   
   // Sort by expected value (descending)
@@ -541,7 +261,7 @@ std::vector<std::pair<int, float>> YahtzeeStrategy::GetTopKeepChoices(
    std::cout << "=== Yahtzee Strategy Query Demo ===\n" << std::endl;
    
    try {
-     YahtzeeStrategy strategy("yahtzee_optimal_v3.bin");
+     YahtzeeStrategy strategy("yahtzee_optimal_v4.bin");
      
      // Test 1: Initial roll
      std::cout << "Test 1: Initial roll [1,1,2,4,5], 2 rolls left" << std::endl;

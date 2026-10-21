@@ -4,10 +4,14 @@ Optimal solo Yahtzee solver in C++ with a 2-player neural network extension.
 
 ## What This Does
 
-**Solo solver (C++):** Computes the exact optimal strategy via reverse-induction dynamic programming over ~536K reachable board states. Produces two precomputed tables:
+**Solo EV solver (C++):** Computes the optimal strategy by reverse-induction dynamic programming over all board states, and stores only the expected value at the start of every turn:
 
-- `yahtzee_optimal_v3.bin` (1.5 GB) — expected value and optimal keep/score decisions for every board state
-- `yahtzee_pmf_v1.bin` (4.7 GB) — full probability distribution over remaining scores for every board state
+- `yahtzee_optimal_v4.bin` (3 MB): every mid-turn decision (which dice to keep, where to score) is recomputed from it on demand in well under a millisecond, so nothing else is stored.
+
+**Exact rational solvers (C++):** No floating point anywhere in the DP:
+
+- `yahtzee_rational_solver` computes every board EV exactly (~5 s), writing `yahtzee_rational_v1.bin` (54 MB) and printing the optimal EV as a reduced fraction.
+- `yahtzee_pmf_solver` computes the exact distribution of the remaining score for every reachable board state under the EV-optimal policy. It writes `yahtzee_pmf_v2.bin` (each state's score range as floats, read by the Python code) and `yahtzee_pmf_exact_start.txt` (the exact distribution of a whole game).
 
 **2-player solver (Python + PyTorch):** Neural network that estimates P(current player wins | both play optimally) for any pair of board states and accumulated score difference. Trained via supervised bootstrap on the PMF table, then refined with TD self-play RL.
 
@@ -15,28 +19,33 @@ Optimal solo Yahtzee solver in C++ with a 2-player neural network extension.
 
 ```
 cpp/
-  yahtzee_strategy.{h,cpp}         shared board state, scoring, dice transitions
-  yahtzee_optimized_solver.cpp     solo EV solver → yahtzee_optimal_v3.bin
-  yahtzee_pmf_solver.cpp           PMF table solver → yahtzee_pmf_v1.bin
-  yahtzee_guide_v3.cpp             interactive solo guide
-  test_{strategy,probabilities}.cpp
+  yahtzee_rules.h                  constants, dice indexing, scoring rules (shared)
+  yahtzee_keep_lattice.h           within-turn keep expectations (shared)
+  yahtzee_bigint.h                 fixed-width big integers (exact solvers)
+  yahtzee_exact_turn.h             exact evaluation of one turn (exact solvers)
+  yahtzee_optimized_solver.cpp     float EV solver → yahtzee_optimal_v4.bin
+  yahtzee_rational_solver.cpp      exact EV solver → yahtzee_rational_v1.bin
+  yahtzee_pmf_solver.cpp           exact PMF solver → yahtzee_pmf_v2.bin
+  yahtzee_strategy.{h,cpp}         strategy queries (keep / category) from board EVs
+  yahtzee_guide.cpp                interactive solo guide
+  test_strategy.cpp                strategy table tests
+  test_keep_lattice.cpp            keep lattice vs brute-force enumeration
 
 python/
-  yahtzee_2player_env.py           game environment, transitions, PMF loader, P_baseline
+  yahtzee_2player_env.py           game environment, PMF loader, P_baseline
   yahtzee_2player_nn.py            PyTorch model (3×256 LayerNorm MLP)
   yahtzee_2player_train.py         supervised bootstrap + TD self-play training
   yahtzee_2player_eval.py          evaluation and diagnostics
-  analyze_reachable.py             state space analysis
 
 docs/
   PMF_SOLVER_NOTES.md              PMF solver algorithm and performance notes
 ```
 
-The `.bin` tables are not in the repo (too large); build them locally with the steps below.
+The data files are not in the repo; build them locally with the steps below.
 
 ## Prerequisites
 
-**C++ solver:** g++ with C++17 and OpenMP.
+**C++:** g++ with C++17 and OpenMP.
 
 **Python (2-player NN):**
 ```bash
@@ -45,28 +54,17 @@ pip install -r requirements.txt
 
 ## Quickstart
 
-### 1. Build and run the solo EV solver
-
 ```bash
-make solver && make solve
-# Produces yahtzee_optimal_v3.bin (~1.5 GB, takes ~5–30 min)
+make all          # build every program
+make solve        # yahtzee_optimal_v4.bin (3 MB, ~4 s)
+make test         # unit tests
+make pmf-solve    # yahtzee_pmf_v2.bin + yahtzee_pmf_exact_start.txt (~40 s; pmf-solve-low for ~2 GB RAM)
+make rational-solve   # optional: exact EV table and fraction
+
+./yahtzee_guide yahtzee_optimal_v4.bin   # interactive guide
 ```
 
-### 2. Generate the PMF table
-
-```bash
-make pmf && make pmf-solve
-# Produces yahtzee_pmf_v1.bin (~4.7 GB, takes ~9 min on 15 cores)
-```
-
-### 3. Interactive solo guide
-
-```bash
-make guide
-./yahtzee_guide yahtzee_optimal_v3.bin
-```
-
-### 4. Train the 2-player NN
+Train the 2-player NN:
 
 ```bash
 # Phase 1: supervised bootstrap (P_baseline labels)
@@ -80,13 +78,22 @@ python python/yahtzee_2player_train.py --phase 3 --load checkpoints_2player/phas
 
 | Metric | Value |
 |--------|-------|
-| Solo EV at start | **254.588** |
-| PMF total probability mass | **1.000000** (exact, no truncation) |
-| PMF score range | 0–1575 (covers all 13-Yahtzee games) |
-| PMF solver runtime | ~9 min on 15 cores |
-| PMF solver speedup | ~700× vs naive triple-loop |
+| Optimal solo EV | **254.58772873449589…** = N / (2^169 · 3^181), N has 140 digits |
+| Most likely final score | 266 (P ≈ 1.26%) |
+| P(score ≥ 200 / 250 / 300) | 86.36% / 48.37% / 14.33% |
+| Final score range | 12 to 1575 |
+| EV solver | ~4 s, 11 MB RAM, 3 MB output |
+| Exact PMF solver | ~37 s on 4 cores, 4.0 GB peak RSS (2.2 GB with `--low-memory`), 1.1 GB output |
 
-The PMF solver uses a three-pass matrix factorization that factors the 252³ nested loop into three sequential DAXPY passes — see [docs/PMF_SOLVER_NOTES.md](docs/PMF_SOLVER_NOTES.md) for details.
+## How It Works
+
+**Board-only storage.** The EV of a mid-turn position follows from the board EVs of the possible next states in two lattice passes, so only the 786K start-of-turn values are stored.
+
+**Keep lattice.** Rerolling the non-kept dice is the same as rolling them one at a time, so `E[K] = (1/6) Σ_f E[K ∪ {f}]` over the 462 kept multisets. One pass gives the value of every keep (1,260 additions) instead of a 462×252 matrix product.
+
+**Exact arithmetic.** Every probability in a turn is a product of 1/6 factors, and `max` only selects one of its arguments, so with *k* turns left every EV and every probability is an integer over the fixed denominator 6^(15k). The exact solvers work on integer numerators only: big-integer addition, multiplication by small constants, and integer comparison. They need no gcd and no fraction comparisons. Numerators fit in at most 9 × 64-bit limbs, and each layer is compiled with the fewest limbs it needs.
+
+**Exact PMF.** With the turn's policy fixed by exact EVs, each final roll's probability is an integer over 6^15 found by pushing weights through the keep lattice, and a state's distribution is a weighted sum of its successors' distributions. Every state is checked exactly (probabilities sum to 1, mean equals the exact EV). See [docs/PMF_SOLVER_NOTES.md](docs/PMF_SOLVER_NOTES.md).
 
 ## 2-Player Solver Design
 

@@ -14,10 +14,13 @@
 #include <vector>
 #include <cassert>
 
+// Failed checks across all tests (non-zero exit if any)
+static int g_failures = 0;
+
 void TestYahtzeeScoring() {
   std::cout << "\n=== Test 1: Yahtzee Scoring (50 vs 0) ===" << std::endl;
   
-  YahtzeeStrategy strategy("yahtzee_optimal_v3.bin");
+  YahtzeeStrategy strategy("yahtzee_optimal_v4.bin");
   
   int failures = 0;
   int tests = 0;
@@ -66,6 +69,7 @@ void TestYahtzeeScoring() {
     }
   }
   
+  g_failures += failures;
   std::cout << "\nTest 1 Results: " << (tests - failures) << "/" << tests 
             << " passed" << std::endl;
   if (failures > 0) {
@@ -76,7 +80,7 @@ void TestYahtzeeScoring() {
 void TestUpperScoreMonotonicity() {
   std::cout << "\n=== Test 2: Upper Score Monotonicity ===" << std::endl;
   
-  YahtzeeStrategy strategy("yahtzee_optimal_v3.bin");
+  YahtzeeStrategy strategy("yahtzee_optimal_v4.bin");
   
   int failures = 0;
   int tests = 0;
@@ -121,6 +125,7 @@ void TestUpperScoreMonotonicity() {
     }
   }
   
+  g_failures += failures;
   std::cout << "\nTest 2 Results: " << (tests - failures) << "/" << tests 
             << " passed" << std::endl;
   if (failures > 0) {
@@ -131,7 +136,7 @@ void TestUpperScoreMonotonicity() {
 void TestYahtzeeOpenVsScoredZero() {
   std::cout << "\n=== Test 3: Yahtzee Open vs Scored Zero ===" << std::endl;
   
-  YahtzeeStrategy strategy("yahtzee_optimal_v3.bin");
+  YahtzeeStrategy strategy("yahtzee_optimal_v4.bin");
   
   int failures = 0;
   int tests = 0;
@@ -181,6 +186,7 @@ void TestYahtzeeOpenVsScoredZero() {
     }
   }
   
+  g_failures += failures;
   std::cout << "\nTest 3 Results: " << (tests - failures) << "/" << tests 
             << " passed" << std::endl;
   if (failures > 0) {
@@ -191,7 +197,7 @@ void TestYahtzeeOpenVsScoredZero() {
 void TestSpecificCases() {
   std::cout << "\n=== Test 4: Specific Test Cases ===" << std::endl;
   
-  YahtzeeStrategy strategy("yahtzee_optimal_v3.bin");
+  YahtzeeStrategy strategy("yahtzee_optimal_v4.bin");
   
   // Test case 1: Empty board, Yahtzee scored differently
   std::cout << "\nCase 1: Empty board (mask=0, upper=0)" << std::endl;
@@ -231,8 +237,8 @@ int main() {
     TestYahtzeeOpenVsScoredZero();
     TestSpecificCases();
     
-    std::cout << "\n=== All Tests Complete ===" << std::endl;
-    return 0;
+    std::cout << "\n=== All Tests Complete: " << g_failures << " failures ===" << std::endl;
+    return g_failures ? 1 : 0;
   } catch (const std::exception& e) {
     std::cerr << "Error: " << e.what() << std::endl;
     return 1;

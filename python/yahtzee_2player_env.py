@@ -51,6 +51,11 @@ for d, dice in enumerate(DICE_COMBOS):
         sids.add(SUBSET_TO_ID[kept])
     VALID_SUBSETS_FOR_OUTCOME.append(sorted(sids))
 
+# Same lists as a (252, 32) array, each row padded with its first entry, so the
+# best keep of every outcome can be taken with one vectorized max
+VALID_SUBSETS_PADDED = np.array(
+    [s + [s[0]] * (32 - len(s)) for s in VALID_SUBSETS_FOR_OUTCOME], dtype=np.int64)
+
 
 def get_dice_id(dice):
     return DICE_TO_ID[tuple(sorted(dice))]
@@ -62,10 +67,6 @@ def get_subset_id(dice):
 
 def board_index(mask, upper, y_state):
     return (mask * MAX_UPPER + upper) * 3 + y_state
-
-
-def roll_index(mask, upper, y_state, dice_id):
-    return board_index(mask, upper, y_state) * NUM_DICE_COMBOS + dice_id
 
 
 def cats_filled(mask, y_state):
@@ -204,47 +205,68 @@ def get_best_scoring_move(dice_id, mask, upper, y_state, board_ev):
 # Load binary strategy files
 # ---------------------------------------------------------------------------
 
-def load_ev_table(filename='yahtzee_optimal_v3.bin'):
+def load_ev_table(filename='yahtzee_optimal_v4.bin'):
     """
-    Load the precomputed EV tables from binary.
+    Load the precomputed start-of-turn EV table from binary.
     Returns board_ev (shape: BOARD_STATE_SIZE,) as a numpy array (float32).
-    Only board_ev is needed at inference time for feature extraction and scoring.
+
+    Accepts version 4 files (board EVs only) and version 3 files (board EVs
+    followed by mid-turn tables, which are ignored: every mid-turn value is
+    recomputed from board_ev, see simulate_turn_solo_optimal).
     """
     with open(filename, 'rb') as f:
         magic, version, board_size, roll_size = struct.unpack('<IIII', f.read(16))
-    if magic != 0x59414854 or version != 3:
+    if magic != 0x59414854 or version not in (3, 4):
         raise ValueError(f'Invalid EV file: magic={hex(magic)} version={version}')
     board_ev = np.memmap(filename, dtype='float32', mode='r',
                          offset=16, shape=(board_size,))
     return board_ev
 
 
-def load_roll_tables(filename='yahtzee_optimal_v3.bin'):
-    """Load all three EV tables (board_ev, roll1_ev, roll2_ev)."""
-    with open(filename, 'rb') as f:
-        magic, version, board_size, roll_size = struct.unpack('<IIII', f.read(16))
-    board_ev = np.memmap(filename, dtype='float32', mode='r',
-                         offset=16, shape=(board_size,))
-    roll1_ev = np.memmap(filename, dtype='float32', mode='r',
-                         offset=16 + board_size * 4, shape=(roll_size,))
-    roll2_ev = np.memmap(filename, dtype='float32', mode='r',
-                         offset=16 + (board_size + roll_size) * 4, shape=(roll_size,))
-    return board_ev, roll1_ev, roll2_ev
-
-
-def load_pmf_table(filename='yahtzee_pmf_v1.bin'):
+class PMFTable:
     """
-    Load precomputed PMF dense arrays via mmap.
-    Returns (pmf_dense, num_states) where pmf_dense shape=(num_states, DENSE_SIZE).
+    Read-only view of the PMF table: pmf[board_index] is a dense float32 row
+    of P(future score = s) for s = 0 .. dense_size-1, and pmf.shape is
+    (num_states, dense_size), like a 2-D array.
+
+    Version 2 files (yahtzee_pmf_v2.bin) store each state's nonzero score
+    range only: an index of {uint32 offset, int16 lo, int16 width} entries,
+    then the float data. Version 1 files store full dense rows.
+    """
+
+    def __init__(self, filename):
+        with open(filename, 'rb') as f:
+            magic, version, num_states, dense_size = struct.unpack('<IIII', f.read(16))
+        if magic != 0x504D4659 or version not in (1, 2):
+            raise ValueError(f'Invalid PMF file: magic={hex(magic)} version={version}')
+        self.version = version
+        self.shape = (num_states, dense_size)
+        if version == 1:
+            self._dense = np.memmap(filename, dtype='float32', mode='r',
+                                    offset=16, shape=self.shape)
+        else:
+            index_dtype = np.dtype([('offset', '<u4'), ('lo', '<i2'), ('width', '<i2')])
+            self._index = np.memmap(filename, dtype=index_dtype, mode='r',
+                                    offset=16, shape=(num_states,))
+            self._data = np.memmap(filename, dtype='float32', mode='r',
+                                   offset=16 + index_dtype.itemsize * num_states)
+
+    def __getitem__(self, idx):
+        if self.version == 1:
+            return self._dense[idx]
+        offset, lo, width = self._index[idx]
+        row = np.zeros(self.shape[1], dtype=np.float32)
+        row[lo:lo + width] = self._data[offset:offset + width]
+        return row
+
+
+def load_pmf_table(filename='yahtzee_pmf_v2.bin'):
+    """
+    Load the precomputed PMF table (memory-mapped).
+    Returns a PMFTable: pmf[board_index] -> dense row of length dense_size.
     dense_size is read from the file header — no hardcoded constant needed.
     """
-    with open(filename, 'rb') as f:
-        magic, version, num_states, dense_size = struct.unpack('<IIII', f.read(16))
-    if magic != 0x504D4659 or version != 1:
-        raise ValueError(f'Invalid PMF file: magic={hex(magic)} version={version}')
-    pmf_dense = np.memmap(filename, dtype='float32', mode='r',
-                          offset=16, shape=(num_states, dense_size))
-    return pmf_dense
+    return PMFTable(filename)
 
 # ---------------------------------------------------------------------------
 # P_baseline: win probability under both-play-solo-optimally
@@ -276,27 +298,46 @@ def compute_p_baseline(mask_c, upper_c, y_c, mask_o, upper_o, y_o, diff, pmf_den
     return float(np.dot(pmf_c, cdf_vals))
 
 # ---------------------------------------------------------------------------
-# Optimal keep selection  (uses roll1_ev / roll2_ev tables)
+# Optimal keep selection  (recomputed from board_ev)
 # ---------------------------------------------------------------------------
 
-def simulate_turn_solo_optimal(mask, upper, y_state, board_ev, roll2_ev):
+def turn_values(mask, upper, y_state, board_ev):
+    """
+    Mid-turn values for one board state, derived from board_ev.
+    Returns (term_vals, roll2_vals), each shape (252,):
+      term_vals[d]  = value of final dice d (best scoring move)
+      roll2_vals[d] = value of dice d with one roll left (best keep)
+    """
+    term_vals = np.empty(NUM_DICE_COMBOS, dtype=np.float32)
+    for d in range(NUM_DICE_COMBOS):
+        res = get_best_scoring_move(d, mask, upper, y_state, board_ev)
+        if res is None:
+            term_vals[d] = 0.0
+        else:
+            _, pts, nm, nu, ny = res
+            term_vals[d] = pts + board_ev[board_index(nm, nu, ny)]
+    keep_ev = TRANS_PROBS @ term_vals                       # (462,)
+    roll2_vals = keep_ev[VALID_SUBSETS_PADDED].max(axis=1)  # (252,)
+    return term_vals, roll2_vals
+
+
+def simulate_turn_solo_optimal(mask, upper, y_state, board_ev):
     """
     Simulate one turn of solo-optimal play via dice rolling.
     Returns (points_scored, next_mask, next_upper, next_y_state).
 
-    Keep decisions use the precomputed EV tables (same logic as C++ guide).
+    Keep decisions are recomputed from board_ev (same logic as C++ guide).
     """
-    bi = board_index(mask, upper, y_state)
-    r2_slice = roll2_ev[bi * NUM_DICE_COMBOS: bi * NUM_DICE_COMBOS + NUM_DICE_COMBOS]
+    term_vals, roll2_vals = turn_values(mask, upper, y_state, board_ev)
 
     # Roll 1
     dice1 = tuple(sorted(int(x) for x in np.random.randint(1, 7, 5)))
     d1 = DICE_TO_ID[dice1]
 
-    # Keep after roll 1: maximise E[roll2_ev over next roll]
+    # Keep after roll 1: maximise E[roll2 value over next roll]
     best_ev, best_sid = -1e30, 0
     for sid in VALID_SUBSETS_FOR_OUTCOME[d1]:
-        ev = float(TRANS_PROBS[sid] @ r2_slice)
+        ev = float(TRANS_PROBS[sid] @ roll2_vals)
         if ev > best_ev:
             best_ev, best_sid = ev, sid
     kept1 = list(ALL_SUBSETS[best_sid])
@@ -306,15 +347,6 @@ def simulate_turn_solo_optimal(mask, upper, y_state, board_ev, roll2_ev):
     d2 = DICE_TO_ID[dice2]
 
     # Keep after roll 2: maximise E[terminal scoring]
-    term_vals = np.empty(NUM_DICE_COMBOS, dtype=np.float32)
-    for d in range(NUM_DICE_COMBOS):
-        res = get_best_scoring_move(d, mask, upper, y_state, board_ev)
-        if res is None:
-            term_vals[d] = 0.0
-        else:
-            _, pts, nm, nu, ny = res
-            term_vals[d] = pts + board_ev[board_index(nm, nu, ny)]
-
     best_ev2, best_sid2 = -1e30, 0
     for sid in VALID_SUBSETS_FOR_OUTCOME[d2]:
         ev = float(TRANS_PROBS[sid] @ term_vals)

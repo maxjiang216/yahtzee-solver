@@ -1,204 +1,110 @@
-# Makefile for Yahtzee Optimal Strategy Solver
-# 
-# Targets:
-#   make solver     - Build the solver (generates strategy file)
-#   make demo       - Build the strategy query demo
-#   make guide      - Build the interactive guide (requires yahtzee_guide.cpp)
-#   make all        - Build everything
-#   make clean      - Remove all build artifacts
-#   make solve      - Run the solver to generate strategy file
-#   make test       - Run the demo to test the strategy
+# Makefile for the Yahtzee solvers
+#
+# Build targets:
+#   make all            - Build every program
+#   make solver         - Float EV solver            (yahtzee_solver)
+#   make rational       - Exact rational EV solver   (yahtzee_rational_solver)
+#   make pmf            - Exact PMF solver           (yahtzee_pmf_solver)
+#   make guide          - Interactive guide          (yahtzee_guide)
+#   make demo           - Strategy query demo        (strategy_demo)
+#
+# Run targets:
+#   make solve          - Generate yahtzee_optimal_v4.bin   (~4 s, 3 MB)
+#   make rational-solve - Generate yahtzee_rational_v1.bin  (~5 s, 54 MB)
+#   make pmf-solve      - Generate yahtzee_pmf_v2.bin + yahtzee_pmf_exact_start.txt (~40 s, ~4 GB RAM)
+#   make pmf-solve-low  - Same with ~2 GB RAM (spills exact layers to temporary files)
+#   make test           - Build and run all unit tests (generates the EV table if needed)
+#
+# Cleanup:
+#   make clean          - Remove executables
+#   make distclean      - Also remove generated data files
 
 CXX = g++
 CXXFLAGS = -O3 -std=c++17 -Wall -Wextra
-LDFLAGS = -fopenmp
+OMPFLAGS = -fopenmp
+# The exact solvers are integer-only, so tuning for the build machine is safe
+EXACTFLAGS = -march=native
 
-# Source files
-SOLVER_SRC = cpp/yahtzee_optimized_solver.cpp
+HEADERS = $(wildcard cpp/*.h)
 STRATEGY_SRC = cpp/yahtzee_strategy.cpp
-GUIDE_SRC = cpp/yahtzee_guide_v3.cpp
 
-# Object files
-SOLVER_OBJ = yahtzee_optimized_solver.o
-STRATEGY_OBJ = yahtzee_strategy.o
-
-# Executables
 SOLVER_BIN = yahtzee_solver
-DEMO_BIN = strategy_demo
-GUIDE_BIN = yahtzee_guide
-TEST_BIN = test_strategy
-
-# Strategy file
-STRATEGY_FILE = yahtzee_optimal_v3.bin
-PMF_FILE = yahtzee_pmf_v1.bin
+RATIONAL_BIN = yahtzee_rational_solver
 PMF_BIN = yahtzee_pmf_solver
+GUIDE_BIN = yahtzee_guide
+DEMO_BIN = strategy_demo
+TEST_BINS = test_strategy test_keep_lattice
 
-# Default target
-.PHONY: all
-all: solver demo pmf
+STRATEGY_FILE = yahtzee_optimal_v4.bin
+RATIONAL_FILE = yahtzee_rational_v1.bin
+PMF_FILE = yahtzee_pmf_v2.bin
+PMF_EXACT_FILE = yahtzee_pmf_exact_start.txt
 
-# Build PMF solver
-.PHONY: pmf
-pmf: $(PMF_BIN)
+.PHONY: all solver rational pmf guide demo solve rational-solve pmf-solve pmf-solve-low \
+        test clean distclean help
 
-$(PMF_BIN): cpp/yahtzee_pmf_solver.cpp
-	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $<
-	@echo "PMF solver built. Run 'make pmf-solve' to generate $(PMF_FILE)"
+all: $(SOLVER_BIN) $(RATIONAL_BIN) $(PMF_BIN) $(GUIDE_BIN) $(DEMO_BIN) $(TEST_BINS)
 
-# Run PMF solver (requires yahtzee_optimal_v3.bin)
-.PHONY: pmf-solve
-pmf-solve: $(PMF_BIN)
-	@if [ ! -f $(STRATEGY_FILE) ]; then \
-		echo "Error: $(STRATEGY_FILE) not found. Run 'make solve' first."; \
-		exit 1; \
-	fi
-	@echo "Running PMF solver (this may take 5-30 minutes)..."
-	./$(PMF_BIN) $(STRATEGY_FILE)
-	@echo "PMF file generated: $(PMF_FILE)"
+# ---------------------------------------------------------------------------
+# Programs
+# ---------------------------------------------------------------------------
 
-# Build solver
-.PHONY: solver
 solver: $(SOLVER_BIN)
+$(SOLVER_BIN): cpp/yahtzee_optimized_solver.cpp $(HEADERS)
+	$(CXX) $(CXXFLAGS) $(OMPFLAGS) -o $@ $<
 
-$(SOLVER_BIN): $(SOLVER_SRC)
-	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $<
-	@echo ""
-	@echo "Solver built successfully!"
-	@echo "Run './$(SOLVER_BIN)' to generate the strategy file"
-	@echo ""
+rational: $(RATIONAL_BIN)
+$(RATIONAL_BIN): cpp/yahtzee_rational_solver.cpp $(HEADERS)
+	$(CXX) $(CXXFLAGS) $(EXACTFLAGS) $(OMPFLAGS) -o $@ $<
 
-# Build demo
-.PHONY: demo
-demo: $(DEMO_BIN)
+pmf: $(PMF_BIN)
+$(PMF_BIN): cpp/yahtzee_pmf_solver.cpp $(HEADERS)
+	$(CXX) $(CXXFLAGS) $(EXACTFLAGS) $(OMPFLAGS) -o $@ $<
 
-$(DEMO_BIN): $(STRATEGY_SRC)
-	$(CXX) $(CXXFLAGS) -DBUILD_DEMO -o $@ $<
-	@echo ""
-	@echo "Demo built successfully!"
-	@echo "Make sure to run the solver first to generate $(STRATEGY_FILE)"
-	@echo "Then run './$(DEMO_BIN)' to test queries"
-	@echo ""
-
-# Build guide (if source file exists)
-.PHONY: guide
 guide: $(GUIDE_BIN)
+$(GUIDE_BIN): cpp/yahtzee_guide.cpp $(STRATEGY_SRC) $(HEADERS)
+	$(CXX) $(CXXFLAGS) -o $@ cpp/yahtzee_guide.cpp $(STRATEGY_SRC)
 
-$(GUIDE_BIN): $(GUIDE_SRC) $(STRATEGY_SRC)
-	$(CXX) $(CXXFLAGS) -o $@ $^
-	@echo ""
-	@echo "Guide built successfully!"
-	@echo "Run './$(GUIDE_BIN) $(STRATEGY_FILE)' to use the interactive guide"
-	@echo ""
+demo: $(DEMO_BIN)
+$(DEMO_BIN): $(STRATEGY_SRC) $(HEADERS)
+	$(CXX) $(CXXFLAGS) -DBUILD_DEMO -o $@ $(STRATEGY_SRC)
 
-# Run solver to generate strategy file
-.PHONY: solve
-solve: $(SOLVER_BIN)
-	@echo "Running solver (this may take 5-30 minutes)..."
-	@echo ""
+test_strategy: cpp/test_strategy.cpp $(STRATEGY_SRC) $(HEADERS)
+	$(CXX) $(CXXFLAGS) -o $@ cpp/test_strategy.cpp $(STRATEGY_SRC)
+
+test_keep_lattice: cpp/test_keep_lattice.cpp $(HEADERS)
+	$(CXX) $(CXXFLAGS) -o $@ $<
+
+# ---------------------------------------------------------------------------
+# Data files
+# ---------------------------------------------------------------------------
+
+solve: $(STRATEGY_FILE)
+$(STRATEGY_FILE): $(SOLVER_BIN)
 	./$(SOLVER_BIN)
-	@echo ""
-	@echo "Strategy file generated: $(STRATEGY_FILE)"
-	@echo "File size: $$(du -h $(STRATEGY_FILE) | cut -f1)"
-	@echo ""
 
-# Build test
-.PHONY: test-build
-test-build: $(TEST_BIN)
+rational-solve: $(RATIONAL_BIN)
+	./$(RATIONAL_BIN) $(RATIONAL_FILE)
 
-$(TEST_BIN): cpp/test_strategy.cpp $(STRATEGY_SRC)
-	$(CXX) $(CXXFLAGS) -o $@ $^
-	@echo ""
-	@echo "Test built successfully!"
-	@echo "Run './$(TEST_BIN)' to run unit tests"
-	@echo ""
+pmf-solve: $(PMF_BIN)
+	./$(PMF_BIN) $(PMF_FILE) $(PMF_EXACT_FILE)
 
-# Test the strategy with demo
-.PHONY: test
-test: $(DEMO_BIN)
-	@if [ ! -f $(STRATEGY_FILE) ]; then \
-		echo "Error: $(STRATEGY_FILE) not found"; \
-		echo "Run 'make solve' first to generate the strategy file"; \
-		exit 1; \
-	fi
-	./$(DEMO_BIN)
+pmf-solve-low: $(PMF_BIN)
+	./$(PMF_BIN) --low-memory $(PMF_FILE) $(PMF_EXACT_FILE)
 
-# Run unit tests
-.PHONY: test-unit
-test-unit: $(TEST_BIN)
-	@if [ ! -f $(STRATEGY_FILE) ]; then \
-		echo "Error: $(STRATEGY_FILE) not found"; \
-		echo "Run 'make solve' first to generate the strategy file"; \
-		exit 1; \
-	fi
-	./$(TEST_BIN)
+# ---------------------------------------------------------------------------
+# Tests and cleanup
+# ---------------------------------------------------------------------------
 
-# Clean build artifacts
-.PHONY: clean
+test: $(TEST_BINS) $(STRATEGY_FILE)
+	./test_keep_lattice
+	./test_strategy
+
 clean:
-	rm -f $(SOLVER_BIN) $(DEMO_BIN) $(GUIDE_BIN) $(TEST_BIN)
-	rm -f $(SOLVER_OBJ) $(STRATEGY_OBJ)
-	@echo "Cleaned build artifacts"
+	rm -f $(SOLVER_BIN) $(RATIONAL_BIN) $(PMF_BIN) $(GUIDE_BIN) $(DEMO_BIN) $(TEST_BINS)
 
-# Clean everything including strategy file
-.PHONY: distclean
 distclean: clean
-	rm -f $(STRATEGY_FILE)
-	@echo "Cleaned all files including strategy data"
+	rm -f $(STRATEGY_FILE) $(RATIONAL_FILE) $(PMF_FILE) $(PMF_EXACT_FILE)
 
-# Help target
-.PHONY: help
 help:
-	@echo "Yahtzee Optimal Strategy Solver - Makefile"
-	@echo ""
-	@echo "Usage:"
-	@echo "  make solver    - Build the solver executable"
-	@echo "  make demo      - Build the strategy query demo"
-	@echo "  make guide     - Build the interactive guide"
-	@echo "  make all       - Build solver and demo"
-	@echo "  make solve     - Run solver to generate strategy file (~5-30 min)"
-	@echo "  make test      - Run demo to test the strategy"
-	@echo "  make clean     - Remove executables and object files"
-	@echo "  make distclean - Remove everything including strategy file"
-	@echo "  make help      - Show this help message"
-	@echo ""
-	@echo "Typical workflow:"
-	@echo "  1. make solver       # Build the solver"
-	@echo "  2. make solve        # Generate strategy (takes time!)"
-	@echo "  3. make demo         # Build the demo"
-	@echo "  4. make test         # Test the strategy"
-	@echo "  5. make guide        # Build interactive guide (optional)"
-	@echo ""
-	@echo "Or simply:"
-	@echo "  make all && make solve && make test"
-	@echo ""
-
-# Show current status
-.PHONY: status
-status:
-	@echo "Build Status:"
-	@echo "-------------"
-	@if [ -f $(SOLVER_BIN) ]; then \
-		echo "✓ Solver built: $(SOLVER_BIN)"; \
-	else \
-		echo "✗ Solver not built (run 'make solver')"; \
-	fi
-	@if [ -f $(DEMO_BIN) ]; then \
-		echo "✓ Demo built: $(DEMO_BIN)"; \
-	else \
-		echo "✗ Demo not built (run 'make demo')"; \
-	fi
-	@if [ -f $(GUIDE_BIN) ]; then \
-		echo "✓ Guide built: $(GUIDE_BIN)"; \
-	else \
-		echo "✗ Guide not built (run 'make guide')"; \
-	fi
-	@echo ""
-	@echo "Data Files:"
-	@echo "-----------"
-	@if [ -f $(STRATEGY_FILE) ]; then \
-		echo "✓ Strategy file exists: $(STRATEGY_FILE)"; \
-		echo "  Size: $$(du -h $(STRATEGY_FILE) | cut -f1)"; \
-	else \
-		echo "✗ Strategy file missing (run 'make solve')"; \
-	fi
-	@echo ""
+	@sed -n '1,21p' Makefile
